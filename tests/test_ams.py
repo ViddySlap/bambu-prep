@@ -106,6 +106,56 @@ def test_match_preset_wrong_suffix_excluded() -> None:
     assert match_preset(tray, "@BBL A1", available) is None
 
 
+def test_match_preset_real_a1_pla_basic() -> None:
+    """Real data from Ben's A1 on 2026-05-11: sub_brand='PLA Basic', SKU name_hint='A00-P06'."""
+    tray = TrayInfo(
+        slot=1,
+        type="PLA",
+        sub_brand="PLA Basic",
+        color="EC008CFF",
+        info_idx="GFA00",
+        name_hint="A00-P06",
+    )
+    available = [
+        "Bambu PLA Basic @BBL A1",
+        "Bambu PLA Matte @BBL A1",
+        "Bambu PETG Translucent @BBL A1",
+    ]
+    assert match_preset(tray, "@BBL A1", available) == "Bambu PLA Basic @BBL A1"
+
+
+def test_match_preset_real_a1_petg_translucent() -> None:
+    """Real data: sub_brand='PETG Translucent', name_hint SKU 'G01-P1'."""
+    tray = TrayInfo(
+        slot=2,
+        type="PETG",
+        sub_brand="PETG Translucent",
+        color="F9C1BD80",
+        info_idx="GFG01",
+        name_hint="G01-P1",
+    )
+    available = [
+        "Bambu PLA Basic @BBL A1",
+        "Bambu PETG Translucent @BBL A1",
+    ]
+    assert match_preset(tray, "@BBL A1", available) == "Bambu PETG Translucent @BBL A1"
+
+
+def test_match_preset_ignores_sku_name_hint() -> None:
+    """SKU-style name_hint must NOT trigger spurious substring matches."""
+    tray = TrayInfo(
+        slot=1,
+        type="PLA",
+        sub_brand="",
+        color="",
+        info_idx="GFA00",
+        name_hint="A00-P06",  # SKU only, no sub_brand
+    )
+    available = ["Bambu PLA Basic @BBL A1"]
+    # No way to resolve without sub_brand - falls to interactive
+    assert match_preset(tray, "@BBL A1", available) is None
+
+
 # ----------------------------------------------------------------------- get_ams_state
 
 

@@ -151,15 +151,25 @@ def filament_suffix_for(machine_profile_name: str) -> str:
 def match_preset(tray: TrayInfo, suffix: str, available: list[str]) -> str | None:
     """Find an installed filament preset matching ``tray``'s RFID hint + ``suffix``.
 
+    For Bambu RFID-tagged filaments, ``tray_sub_brands`` carries the human
+    family name (``"PLA Basic"``, ``"PETG Translucent"``) and Bambu's preset
+    files are named ``"Bambu {sub_brand} {suffix}"``. ``tray_id_name`` is an
+    internal SKU code (``"A00-P06"``, ``"G01-P1"``) and is *not* useful for
+    matching against preset filenames - verified live on Ben's A1 2026-05-11.
+
     Returns the preset's name on unambiguous match, or ``None`` otherwise.
     """
-    hint = tray.name_hint or tray.sub_brand
+    if tray.sub_brand:
+        target = f"Bambu {tray.sub_brand} {suffix}"
+        if target in available:
+            return target
+        target = f"{tray.sub_brand} {suffix}"
+        if target in available:
+            return target
+
+    hint = tray.sub_brand or tray.name_hint
     if not hint:
         return None
-
-    target = f"{hint} {suffix}"
-    if target in available:
-        return target
 
     candidates = [
         name
