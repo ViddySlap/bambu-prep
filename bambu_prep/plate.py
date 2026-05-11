@@ -31,8 +31,10 @@ should put lowest-priority copies last.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +93,21 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 def default_runner(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def _output_uses_multiple_plates(output_path: Path) -> bool:
+    """True if the CLI auto-paginated onto more than one plate.
+
+    Bambu's CLI doesn't fail when objects overflow; it just creates a
+    plate_2. Reading model_settings.config for a second ``<plate>`` block
+    is the cheapest reliable detector.
+    """
+    try:
+        with zipfile.ZipFile(output_path) as zf:
+            cfg = zf.read("Metadata/model_settings.config").decode("utf-8", errors="replace")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+    return len(re.findall(r"<plate>", cfg)) > 1
 
 
 def _physical_inputs(items: list[PlateItem], job_dir: Path) -> dict[int, Path]:
@@ -289,6 +306,12 @@ def prepare_plate(
             last_stderr = completed.stderr or ""
 
             if completed.returncode == 0 and output_path.is_file():
+                # Bambu Studio's CLI silently paginates onto additional plates
+                # when one isn't enough. We want a single-plate result; treat
+                # multi-plate output as overflow and shrink.
+                if _output_uses_multiple_plates(output_path):
+                    dropped.insert(0, items_remaining.pop())
+                    continue
                 slot_per_object = [
                     cli_in.ams_slot
                     for cli_in in cli_inputs

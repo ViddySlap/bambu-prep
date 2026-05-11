@@ -53,10 +53,13 @@ def _build_config(tmp_path: Path) -> Config:
     )
 
 
-def _build_fake_3mf(cmd: list[str]) -> bytes:
+def _build_fake_3mf(cmd: list[str], *, plate_count: int = 1) -> bytes:
     """Construct a minimal .3mf zip whose model_settings.config has one
     <object> per CLI input clone, in input order. This is enough for
-    prepare_plate's post-CLI patch_filament_slots step to run end-to-end."""
+    prepare_plate's post-CLI patch_filament_slots step to run end-to-end.
+
+    ``plate_count`` lets a test simulate the CLI auto-paginating across plates.
+    """
     idx = cmd.index("--clone-objects")
     counts = [int(x) for x in cmd[idx + 1].split(",")]
     total = sum(counts)
@@ -66,9 +69,10 @@ def _build_fake_3mf(cmd: list[str]) -> bytes:
         f"  </object>"
         for i in range(total)
     )
+    plates_xml = "\n".join(f"  <plate>\n  </plate>" for _ in range(plate_count))
     config_text = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f"<config>\n{objects_xml}\n</config>\n"
+        f"<config>\n{objects_xml}\n{plates_xml}\n</config>\n"
     )
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -79,16 +83,20 @@ def _build_fake_3mf(cmd: list[str]) -> bytes:
 
 
 class FakeRunner:
-    """Pluggable subprocess.run replacement for plate.py tests."""
+    """Pluggable subprocess.run replacement for plate.py tests.
+
+    Each entry in ``results`` is either ``(returncode, write_output)`` or
+    ``(returncode, write_output, plate_count)`` to simulate the CLI
+    auto-paginating across plates.
+    """
 
     def __init__(
         self,
-        results: list[tuple[int, bool]],
+        results: list[tuple],
         output_path: Path,
         stdout: str = "",
         stderr: str = "",
     ) -> None:
-        """``results`` is a list of (returncode, should_create_output_file) per call."""
         self._results = list(results)
         self._output_path = output_path
         self._stdout = stdout
@@ -99,10 +107,12 @@ class FakeRunner:
         self.calls.append(list(cmd))
         if not self._results:
             raise AssertionError("FakeRunner called more times than scripted")
-        rc, write_output = self._results.pop(0)
+        entry = self._results.pop(0)
+        rc, write_output = entry[0], entry[1]
+        plate_count = entry[2] if len(entry) >= 3 else 1
         if write_output:
             self._output_path.parent.mkdir(parents=True, exist_ok=True)
-            self._output_path.write_bytes(_build_fake_3mf(cmd))
+            self._output_path.write_bytes(_build_fake_3mf(cmd, plate_count=plate_count))
         return subprocess.CompletedProcess(
             args=cmd, returncode=rc, stdout=self._stdout, stderr=self._stderr
         )
@@ -533,6 +543,35 @@ def test_prepare_plate_patches_single_slot_uses_slot_1(tmp_path: Path) -> None:
     )
     # Single-slot plates still get explicit slot=1 metadata written by the patch.
     assert _extruder_counts_in_3mf(out) == Counter({"1": 3})
+
+
+def test_prepare_plate_multi_plate_treated_as_overflow(tmp_path: Path) -> None:
+    """The CLI silently paginates onto plate 2 instead of failing on overflow.
+    prepare_plate must detect this and drop the last item to force single-plate."""
+    cfg = _build_config(tmp_path)
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl)
+    out = tmp_path / "out.3mf"
+
+    # First call: CLI succeeds but writes 2 plates -> treat as overflow.
+    # Second call (after shrink): CLI succeeds with 1 plate -> accept.
+    items = [PlateItem(stl, 1.0, 1)] * 3
+    runner = FakeRunner(
+        results=[(0, True, 2), (0, True, 1)],
+        output_path=out,
+    )
+    result = prepare_plate(
+        items=items,
+        machine_profile="Test A1",
+        process_profile="Test 0.2mm",
+        output_path=out,
+        ams_state={1: "Test Matte Black"},
+        config=cfg,
+        runner=runner,
+    )
+    assert result.fit == 2
+    assert result.dropped == [items[-1]]
+    assert len(runner.calls) == 2
 
 
 def test_prepare_plate_keep_temp_preserves_job_dir(tmp_path: Path) -> None:
