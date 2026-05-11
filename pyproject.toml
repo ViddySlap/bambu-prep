@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bambu-prep"
+version = "0.1.0"
+description = "Agent-driven print prep for Bambu Lab printers: build unsliced .3mf plates from PlateItem lists."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "ViddySlap", email = "ben@barosdesign.com" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Printing",
+]
+dependencies = [
+    "trimesh>=4.0",
+    "numpy>=1.26",
+    "click>=8.1",
+    "bambulabs-api>=2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+bambu-prep = "bambu_prep.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bambu_prep*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

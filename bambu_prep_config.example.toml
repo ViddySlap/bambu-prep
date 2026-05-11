@@ -1,0 +1,36 @@
+# bambu-prep configuration template.
+#
+# Copy this file to one of:
+#   - %APPDATA%/bambu-prep/config.toml      (Windows default)
+#   - $XDG_CONFIG_HOME/bambu-prep/config.toml (Linux/macOS)
+#   - or set BAMBU_PREP_CONFIG to a custom path.
+#
+# Printer credentials should NOT be inlined here in any committed copy.
+# Use secret_refs to pull from environment variables, which are populated
+# from your local secret store (e.g. ViddyVault/secrets.md on Ben's machine).
+
+[paths]
+bambu_studio_exe = "C:/Program Files/Bambu Studio/bambu-studio.exe"
+bambu_resources_dir = "C:/Program Files/Bambu Studio/resources"
+# User profile dir layered on top of vendor profiles when populated.
+# Bambu Studio's per-user dir is %APPDATA%/BambuStudio/user/<account_id>.
+bambu_user_dir = ""
+# Where pre-scaled temp STLs are written. Defaults to %TEMP%/bambu-prep when blank.
+temp_scratch_dir = ""
+
+[printer]
+# Set these via env vars referenced below. Leave blank if you only want
+# interactive AMS confirmation (no live MQTT query).
+ip = ""
+serial = ""
+
+[secret_refs]
+# Map config keys to environment variable names. Resolved at load time.
+"printer.access_code" = "BAMBU_A1_ACCESS_CODE"
+"printer.ip"          = "BAMBU_A1_IP"
+"printer.serial"      = "BAMBU_A1_SERIAL"
+
+[behavior]
+allow_rotations = false
+ensure_on_bed   = true
+allow_mix_temp  = false

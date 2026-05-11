@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# VS Code
+.vscode/
+
+# Build artifacts
+dist/
+build/
+
+# Local config (may reference secrets via env vars)
+bambu_prep_config.toml
+
+# Local scratch
+scratch/
