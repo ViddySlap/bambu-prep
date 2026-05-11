@@ -1,5 +1,9 @@
+import io
 import json
+import re
 import subprocess
+import zipfile
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -49,6 +53,31 @@ def _build_config(tmp_path: Path) -> Config:
     )
 
 
+def _build_fake_3mf(cmd: list[str]) -> bytes:
+    """Construct a minimal .3mf zip whose model_settings.config has one
+    <object> per CLI input clone, in input order. This is enough for
+    prepare_plate's post-CLI patch_filament_slots step to run end-to-end."""
+    idx = cmd.index("--clone-objects")
+    counts = [int(x) for x in cmd[idx + 1].split(",")]
+    total = sum(counts)
+    objects_xml = "\n".join(
+        f'  <object id="{2 * (i + 1)}">\n'
+        f'    <metadata key="name" value="cube_{i + 1}"/>\n'
+        f"  </object>"
+        for i in range(total)
+    )
+    config_text = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f"<config>\n{objects_xml}\n</config>\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Metadata/model_settings.config", config_text)
+        zf.writestr("Metadata/project_settings.config", "{}")
+        zf.writestr("3D/3dmodel.model", "<model/>")
+    return buf.getvalue()
+
+
 class FakeRunner:
     """Pluggable subprocess.run replacement for plate.py tests."""
 
@@ -73,10 +102,17 @@ class FakeRunner:
         rc, write_output = self._results.pop(0)
         if write_output:
             self._output_path.parent.mkdir(parents=True, exist_ok=True)
-            self._output_path.write_text("fake .3mf payload")
+            self._output_path.write_bytes(_build_fake_3mf(cmd))
         return subprocess.CompletedProcess(
             args=cmd, returncode=rc, stdout=self._stdout, stderr=self._stderr
         )
+
+
+def _extruder_counts_in_3mf(path: Path) -> Counter[str]:
+    """Read model_settings.config from a .3mf and tally extruder values."""
+    with zipfile.ZipFile(path) as zf:
+        cfg = zf.read("Metadata/model_settings.config").decode("utf-8")
+    return Counter(re.findall(r'<metadata\s+key="extruder"\s+value="(\d+)"', cfg))
 
 
 # ----------------------------------------------------------------------- consolidate
@@ -147,7 +183,7 @@ def test_build_cli_args_basic_shape(tmp_path: Path) -> None:
         "Test A1.json;" + str(Path("/p/Test 0.2mm.json"))
     )
     assert args[args.index("--clone-objects") + 1] == "3,2"
-    assert args[args.index("--load-filament-ids") + 1] == "1,2"
+    assert "--load-filament-ids" not in args  # broken on Studio 02.05.00.66; patch.py handles
     assert args[args.index("--export-3mf") + 1] == "out.3mf"
     assert args[args.index("--outputdir") + 1] == str(tmp_path)
     # Positional inputs come at the very end, in order
@@ -194,7 +230,25 @@ def test_build_cli_args_respects_behavior_flags(tmp_path: Path) -> None:
     )
     assert "--allow-rotations" in args
     assert "--ensure-on-bed" not in args
-    assert "--allow-mix-temp" in args
+    # --allow-mix-temp takes a value per bambu-studio.exe --help
+    idx = args.index("--allow-mix-temp")
+    assert args[idx + 1] == "1"
+
+
+def test_build_cli_args_arrange_and_orient_take_values(tmp_path: Path) -> None:
+    """Both flags take a 0/1/auto value, not a bare flag form."""
+    cfg = _build_config(tmp_path)
+    inputs = [CliInput(path=tmp_path / "a.stl", clone_count=1, ams_slot=1)]
+    args = build_cli_args(
+        inputs,
+        machine_profile_path=Path("m.json"),
+        process_profile_path=Path("p.json"),
+        filament_paths_by_slot={1: Path("f.json")},
+        output_path=tmp_path / "out.3mf",
+        config=cfg,
+    )
+    assert args[args.index("--arrange") + 1] == "1"
+    assert args[args.index("--orient") + 1] == "1"
 
 
 def test_build_cli_args_rejects_empty_inputs(tmp_path: Path) -> None:
@@ -238,7 +292,7 @@ def test_prepare_plate_happy_path(tmp_path: Path) -> None:
     # One CLI input, clone_count=3
     cmd = runner.calls[0]
     assert cmd[cmd.index("--clone-objects") + 1] == "3"
-    assert cmd[cmd.index("--load-filament-ids") + 1] == "1"
+    assert "--load-filament-ids" not in cmd
 
 
 def test_prepare_plate_pre_scales_when_scales_differ(tmp_path: Path) -> None:
@@ -263,8 +317,7 @@ def test_prepare_plate_pre_scales_when_scales_differ(tmp_path: Path) -> None:
     cmd = runner.calls[0]
     # Three distinct input files, one clone each
     assert cmd[cmd.index("--clone-objects") + 1] == "1,1,1"
-    # All slot 1
-    assert cmd[cmd.index("--load-filament-ids") + 1] == "1,1,1"
+    assert "--load-filament-ids" not in cmd
     # Inputs at the tail are temp pre-scaled STLs, not the source
     inputs_at_tail = cmd[-3:]
     assert all(str(stl) != tail for tail in inputs_at_tail)
@@ -401,6 +454,54 @@ def test_prepare_plate_cleans_up_temp_by_default(tmp_path: Path) -> None:
     scratch = cfg.paths.temp_scratch_dir
     if scratch.is_dir():
         assert list(scratch.iterdir()) == []
+
+
+def test_prepare_plate_patches_extruder_metadata_multi_slot(tmp_path: Path) -> None:
+    """End-to-end: prepare_plate's post-CLI patch injects per-object extruder."""
+    cfg = _build_config(tmp_path)
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl)
+    out = tmp_path / "out.3mf"
+
+    items = [
+        PlateItem(stl, 1.0, 1),
+        PlateItem(stl, 1.0, 1),
+        PlateItem(stl, 1.0, 2),
+        PlateItem(stl, 1.0, 2),
+        PlateItem(stl, 1.0, 2),
+    ]
+    runner = FakeRunner(results=[(0, True)], output_path=out)
+    result = prepare_plate(
+        items=items,
+        machine_profile="Test A1",
+        process_profile="Test 0.2mm",
+        output_path=out,
+        ams_state={1: "Test Matte Black", 2: "Test White"},
+        config=cfg,
+        runner=runner,
+    )
+    assert result.fit == 5
+    assert _extruder_counts_in_3mf(out) == Counter({"1": 2, "2": 3})
+
+
+def test_prepare_plate_patches_single_slot_uses_slot_1(tmp_path: Path) -> None:
+    cfg = _build_config(tmp_path)
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl)
+    out = tmp_path / "out.3mf"
+
+    runner = FakeRunner(results=[(0, True)], output_path=out)
+    prepare_plate(
+        items=[PlateItem(stl, 1.0, 1)] * 3,
+        machine_profile="Test A1",
+        process_profile="Test 0.2mm",
+        output_path=out,
+        ams_state={1: "Test Matte Black"},
+        config=cfg,
+        runner=runner,
+    )
+    # Single-slot plates still get explicit slot=1 metadata written by the patch.
+    assert _extruder_counts_in_3mf(out) == Counter({"1": 3})
 
 
 def test_prepare_plate_keep_temp_preserves_job_dir(tmp_path: Path) -> None:

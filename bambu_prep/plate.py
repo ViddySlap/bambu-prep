@@ -39,6 +39,7 @@ from pathlib import Path
 
 from bambu_prep.config import Config
 from bambu_prep.meshes import make_job_dir, prescale
+from bambu_prep.patch import patch_filament_slots
 from bambu_prep.profiles import resolve as resolve_profile
 
 
@@ -151,6 +152,10 @@ def build_cli_args(
         str(filament_paths_by_slot.get(slot, filler)) for slot in range(1, max_slot + 1)
     ]
 
+    # NOTE: --load-filament-ids is silently ignored by Bambu Studio 02.05.00.66
+    # in plate-prep CLI mode (verified 2026-05-11). The per-object slot
+    # assignment is applied by bambu_prep.patch.patch_filament_slots after
+    # the CLI returns.
     args: list[str] = [
         str(config.paths.bambu_studio_exe),
         "--load-settings",
@@ -159,18 +164,17 @@ def build_cli_args(
         ";".join(filaments),
         "--clone-objects",
         ",".join(str(i.clone_count) for i in inputs),
-        "--load-filament-ids",
-        ",".join(str(i.ams_slot) for i in inputs),
         "--arrange",
         "1",
         "--orient",
+        "1",
     ]
     if config.behavior.allow_rotations:
         args.append("--allow-rotations")
     if config.behavior.ensure_on_bed:
         args.append("--ensure-on-bed")
     if config.behavior.allow_mix_temp:
-        args.append("--allow-mix-temp")
+        args.extend(["--allow-mix-temp", "1"])
     args.extend(
         [
             "--outputdir",
@@ -275,6 +279,12 @@ def prepare_plate(
             last_stderr = completed.stderr or ""
 
             if completed.returncode == 0 and output_path.is_file():
+                slot_per_object = [
+                    cli_in.ams_slot
+                    for cli_in in cli_inputs
+                    for _ in range(cli_in.clone_count)
+                ]
+                patch_filament_slots(output_path, slot_per_object)
                 return PrepareResult(
                     fit=len(items_remaining),
                     requested=len(items),
