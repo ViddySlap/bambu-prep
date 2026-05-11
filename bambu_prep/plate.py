@@ -47,7 +47,7 @@ from bambu_prep.meshes import (
     prescale,
     scale_suffix,
 )
-from bambu_prep.patch import patch_filament_slots
+from bambu_prep.patch import finalize_cli_output
 from bambu_prep.profiles import resolve as resolve_profile
 
 
@@ -317,7 +317,7 @@ def prepare_plate(
                     for cli_in in cli_inputs
                     for _ in range(cli_in.clone_count)
                 ]
-                patch_filament_slots(output_path, slot_per_object)
+                finalize_cli_output(output_path, slot_per_object)
                 return PrepareResult(
                     fit=len(items_remaining),
                     requested=len(items),

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from bambu_prep.patch import PatchError, patch_filament_slots
+from bambu_prep.patch import PatchError, finalize_cli_output, patch_filament_slots
 
 
 def _make_3mf(tmp_path: Path, *, object_count: int, existing_extruders: list[int] | None = None) -> Path:
@@ -113,3 +113,162 @@ def test_patch_handles_unescaped_quotes_in_config(tmp_path: Path) -> None:
     with zipfile.ZipFile(path) as zf:
         out = zf.read("Metadata/model_settings.config").decode("utf-8")
     assert '""Bambu Lab A1 0.4 nozzle""' in out
+
+
+# ----------------------------------------------------------------------- finalize_cli_output
+
+
+def _make_split_form_cli_output(tmp_path: Path, *, slot_per_object: int = 1) -> Path:
+    """Build a .3mf that mimics bambu-studio.exe's broken CLI output:
+    split-file 3MF Production Extension, malformed model_settings.config,
+    production-extension cruft.
+    """
+    root_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+        'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" '
+        'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" '
+        'requiredextensions="p">\n'
+        ' <resources>\n'
+        '  <object id="2" p:UUID="00000001-aaaa-bbbb-cccc-dddddddddddd" type="model">\n'
+        '   <components>\n'
+        '    <component p:path="/3D/Objects/object_1.model" objectid="1" '
+        'p:UUID="00010000-aaaa-bbbb-cccc-dddddddddddd" '
+        'transform="1 0 0 0 1 0 0 0 1 0 0 0"/>\n'
+        '   </components>\n'
+        '  </object>\n'
+        ' </resources>\n'
+        ' <build p:UUID="aaaa-bbbb-cccc-dddd-eeee">\n'
+        '  <item objectid="2" p:UUID="00000002-aaaa-bbbb-cccc-dddddddddddd" '
+        'transform="1 0 0 0 1 0 0 0 1 100 100 5" printable="1"/>\n'
+        ' </build>\n'
+        '</model>\n'
+    )
+    object_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model>\n'
+        ' <resources>\n'
+        '  <object id="1" type="model">\n'
+        '   <mesh>\n'
+        '    <vertices>\n'
+        '     <vertex x="0" y="0" z="0"/>\n'
+        '     <vertex x="1" y="0" z="0"/>\n'
+        '     <vertex x="0" y="1" z="0"/>\n'
+        '    </vertices>\n'
+        '    <triangles>\n'
+        '     <triangle v1="0" v2="1" v3="2"/>\n'
+        '    </triangles>\n'
+        '   </mesh>\n'
+        '  </object>\n'
+        ' </resources>\n'
+        '</model>\n'
+    )
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships>\n'
+        ' <Relationship Target="/3D/Objects/object_1.model" Id="rel-1" '
+        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>\n'
+        '</Relationships>\n'
+    )
+    model_settings_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<config>\n'
+        '  <object id="2">\n'
+        '    <metadata key="name" value="cube.stl"/>\n'
+        '    <metadata key="compatible_printers" value=""Bambu Lab A1 0.4 nozzle""/>\n'
+        '    <metadata key="default_acceleration" value="6000"/>\n'
+        '    <metadata key="inherits" value="fdm_process_single_0.20"/>\n'
+        '    <metadata key="print_settings_id" value="0.20mm Standard @BBL A1"/>\n'
+        '    <metadata key="travel_speed" value="700"/>\n'
+        '    <metadata face_count="1"/>\n'
+        '  </object>\n'
+        '  <plate>\n'
+        '    <metadata key="plater_id" value="1"/>\n'
+        '    <metadata key="gcode_file" value=""/>\n'
+        '  </plate>\n'
+        '</config>\n'
+    )
+
+    path = tmp_path / "cli_output.3mf"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("3D/3dmodel.model", root_xml)
+        zf.writestr("3D/Objects/object_1.model", object_xml)
+        zf.writestr("3D/_rels/3dmodel.model.rels", rels_xml)
+        zf.writestr("Metadata/model_settings.config", model_settings_xml)
+    return path
+
+
+def test_finalize_inlines_geometry(tmp_path: Path) -> None:
+    """After finalize, 3D/Objects/ is gone and geometry is inside 3D/3dmodel.model."""
+    path = _make_split_form_cli_output(tmp_path)
+    finalize_cli_output(path, [1])
+
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        root = zf.read("3D/3dmodel.model").decode("utf-8")
+
+    assert not any(n.startswith("3D/Objects/") for n in names)
+    assert "3D/_rels/3dmodel.model.rels" not in names
+    assert "<mesh>" in root
+    assert "<vertices>" in root
+    assert "<components>" not in root
+
+
+def test_finalize_strips_production_extension(tmp_path: Path) -> None:
+    """xmlns:p, requiredextensions, p:UUID must all be removed after inlining."""
+    path = _make_split_form_cli_output(tmp_path)
+    finalize_cli_output(path, [1])
+
+    with zipfile.ZipFile(path) as zf:
+        root = zf.read("3D/3dmodel.model").decode("utf-8")
+
+    assert "xmlns:p=" not in root
+    assert 'requiredextensions="p"' not in root
+    assert "p:UUID=" not in root
+
+
+def test_finalize_sanitizes_model_settings(tmp_path: Path) -> None:
+    """Malformed CLI-injected metadata keys are stripped from model_settings.config."""
+    path = _make_split_form_cli_output(tmp_path)
+    finalize_cli_output(path, [1])
+
+    with zipfile.ZipFile(path) as zf:
+        cfg = zf.read("Metadata/model_settings.config").decode("utf-8")
+
+    # The malformed line and its siblings should all be gone.
+    assert "compatible_printers" not in cfg
+    assert "default_acceleration" not in cfg
+    assert "inherits" not in cfg
+    assert "print_settings_id" not in cfg
+    assert "travel_speed" not in cfg
+    assert 'gcode_file" value=""' not in cfg
+    # But the valid name metadata is preserved.
+    assert 'key="name" value="cube.stl"' in cfg
+
+
+def test_finalize_injects_extruder_metadata(tmp_path: Path) -> None:
+    path = _make_split_form_cli_output(tmp_path)
+    finalize_cli_output(path, [2])
+
+    with zipfile.ZipFile(path) as zf:
+        cfg = zf.read("Metadata/model_settings.config").decode("utf-8")
+
+    assert '<metadata key="extruder" value="2"/>' in cfg
+
+
+def test_finalize_idempotent(tmp_path: Path) -> None:
+    """Running finalize twice produces the same output."""
+    path = _make_split_form_cli_output(tmp_path)
+    finalize_cli_output(path, [1])
+    with zipfile.ZipFile(path) as zf:
+        first_root = zf.read("3D/3dmodel.model")
+        first_cfg = zf.read("Metadata/model_settings.config")
+
+    finalize_cli_output(path, [1])
+    with zipfile.ZipFile(path) as zf:
+        second_root = zf.read("3D/3dmodel.model")
+        second_cfg = zf.read("Metadata/model_settings.config")
+
+    assert first_root == second_root
+    assert first_cfg == second_cfg
