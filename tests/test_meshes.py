@@ -123,6 +123,52 @@ def test_prescale_many_filenames_sort_lexically(tmp_path: Path) -> None:
     assert names_lex_sorted == expected_numeric_order
 
 
+def test_prescale_anisotropic_3tuple(tmp_path: Path) -> None:
+    """Per-axis scale applies different factors to X, Y, Z."""
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl, side=10.0)
+    out = tmp_path / "out.stl"
+
+    prescale(stl, (1.02, 1.02, 1.04), out)
+
+    extents = _bbox_extents(out)
+    assert np.allclose(extents, [10.2, 10.2, 10.4])
+
+
+def test_prescale_identity_3tuple_writes_unchanged(tmp_path: Path) -> None:
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl, side=10.0)
+    out = tmp_path / "out.stl"
+
+    prescale(stl, (1.0, 1.0, 1.0), out)
+
+    extents = _bbox_extents(out)
+    assert np.allclose(extents, [10.0, 10.0, 10.0])
+
+
+def test_prescale_anisotropic_filename_encodes_all_axes(tmp_path: Path) -> None:
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl)
+    out_dir = tmp_path / "scaled"
+
+    results = prescale_many(stl, [(1.02, 1.02, 1.04), (1.025, 1.025, 1.05)], out_dir)
+    names = [r.output.name for r in results]
+    assert names == [
+        "cube_s1.0200x1.0200x1.0400.stl",
+        "cube_s1.0250x1.0250x1.0500.stl",
+    ]
+
+
+def test_prescale_rejects_bad_3tuple(tmp_path: Path) -> None:
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl)
+    out = tmp_path / "out.stl"
+    with pytest.raises(MeshError, match="3-tuple"):
+        prescale(stl, (1.0, 1.0), out)  # type: ignore[arg-type]
+    with pytest.raises(MeshError, match="positive"):
+        prescale(stl, (1.0, -1.0, 1.0), out)
+
+
 def test_prescale_many_empty_returns_empty(tmp_path: Path) -> None:
     stl = tmp_path / "cube.stl"
     _write_cube(stl)

@@ -38,17 +38,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from bambu_prep.config import Config
-from bambu_prep.meshes import make_job_dir, prescale
+from bambu_prep.meshes import (
+    ScaleFactor,
+    is_identity_scale,
+    make_job_dir,
+    prescale,
+    scale_suffix,
+)
 from bambu_prep.patch import patch_filament_slots
 from bambu_prep.profiles import resolve as resolve_profile
 
 
 @dataclass(frozen=True)
 class PlateItem:
-    """One printable copy on the plate."""
+    """One printable copy on the plate.
+
+    ``scale`` is either a float (uniform across all three axes) or a
+    ``tuple[float, float, float]`` for anisotropic X/Y/Z scaling.
+    """
 
     stl_path: Path
-    scale: float = 1.0
+    scale: ScaleFactor = 1.0
     ams_slot: int = 1
 
 
@@ -86,19 +96,19 @@ def default_runner(cmd: list[str]) -> subprocess.CompletedProcess:
 def _physical_inputs(items: list[PlateItem], job_dir: Path) -> dict[int, Path]:
     """Return ``{item_index: physical_stl_path}`` for each PlateItem.
 
-    Items with ``scale == 1.0`` map to their source STL directly. Items with
-    other scales are pre-scaled once per ``(source, scale)`` pair into
-    ``job_dir``; subsequent items reuse the cached temp STL.
+    Identity-scale items (scale 1.0 or (1, 1, 1)) map to their source STL
+    directly. Anything else is pre-scaled once per ``(source, scale)`` pair
+    into ``job_dir``; subsequent items reuse the cached temp STL.
     """
-    cache: dict[tuple[Path, float], Path] = {}
+    cache: dict[tuple[Path, ScaleFactor], Path] = {}
     out: dict[int, Path] = {}
     for i, item in enumerate(items):
-        if item.scale == 1.0:
+        if is_identity_scale(item.scale):
             out[i] = item.stl_path
             continue
         key = (item.stl_path, item.scale)
         if key not in cache:
-            output = job_dir / f"{item.stl_path.stem}_s{item.scale:.4f}.stl"
+            output = job_dir / f"{item.stl_path.stem}_{scale_suffix(item.scale)}.stl"
             if not output.is_file():
                 prescale(item.stl_path, item.scale, output)
             cache[key] = output

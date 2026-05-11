@@ -7,7 +7,7 @@ from bambu_prep.ams import (
     get_ams_state,
 )
 from bambu_prep.config import Behavior, Config, Paths, Printer, load_config
-from bambu_prep.meshes import MeshError, ScaledMesh, prescale
+from bambu_prep.meshes import MeshError, ScaledMesh, ScaleFactor, prescale
 from bambu_prep.plate import (
     CliInput,
     PlateItem,
@@ -32,6 +32,7 @@ __all__ = [
     "Printer",
     "Profile",
     "ProfileError",
+    "ScaleFactor",
     "ScaledMesh",
     "TrayInfo",
     "__version__",

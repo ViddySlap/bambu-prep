@@ -295,6 +295,37 @@ def test_prepare_plate_happy_path(tmp_path: Path) -> None:
     assert "--load-filament-ids" not in cmd
 
 
+def test_prepare_plate_anisotropic_scaling_pre_scales(tmp_path: Path) -> None:
+    """Per-axis scale tuples are pre-scaled to temp STLs like uniform scales."""
+    cfg = _build_config(tmp_path)
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl)
+    out = tmp_path / "out.3mf"
+
+    runner = FakeRunner(results=[(0, True)], output_path=out)
+    result = prepare_plate(
+        items=[
+            PlateItem(stl, (1.02, 1.02, 1.04), 1),
+            PlateItem(stl, (1.023, 1.023, 1.045), 1),
+            PlateItem(stl, (1.025, 1.025, 1.05), 1),
+        ],
+        machine_profile="Test A1",
+        process_profile="Test 0.2mm",
+        output_path=out,
+        ams_state={1: "Test Matte Black"},
+        config=cfg,
+        runner=runner,
+        keep_temp=True,
+    )
+    assert result.fit == 3
+    cmd = runner.calls[0]
+    assert cmd[cmd.index("--clone-objects") + 1] == "1,1,1"
+    # Three distinct pre-scaled temp STLs, filename encodes all three axes
+    tail = cmd[-3:]
+    assert all(name.endswith(".stl") for name in tail)
+    assert all("x1.0" in name for name in tail)
+
+
 def test_prepare_plate_pre_scales_when_scales_differ(tmp_path: Path) -> None:
     cfg = _build_config(tmp_path)
     stl = tmp_path / "cube.stl"

@@ -1,14 +1,20 @@
 """Mesh pre-scaling primitives.
 
 Bambu Studio's CLI exposes ``--scale`` as a *global* uniform-scale per
-invocation, not per-input-file. For the iPhone-case-at-N-scales workflow
-(101%, 102%, ..., 110% of the same STL on one plate), the only way to get
-varied scales onto one plate is to pre-scale each copy to its own STL and
-feed each as a separate input on the CLI command line.
+invocation, not per-input-file, and only as a scalar. To vary scale across
+copies on one plate, we pre-scale each copy to its own STL and feed each
+as a separate input on the CLI command line.
 
-This module provides the primitive: load a mesh, apply a uniform scale,
-write to a temp file. Decisions about *when* to call it (consolidation,
-job lifecycle) live in :mod:`bambu_prep.plate`.
+Scales come in two forms:
+
+- ``float`` (uniform): applied to all three axes.
+- ``tuple[float, float, float]`` (anisotropic): one factor per X / Y / Z axis.
+  Stage 1.5 feature; needed for cases that stretch along one axis (e.g. a
+  phone case that needs Z taller without growing X/Y).
+
+This module provides the primitive: load a mesh, apply a scale, write to a
+temp file. Decisions about *when* to call it (consolidation, job lifecycle)
+live in :mod:`bambu_prep.plate`.
 """
 
 from __future__ import annotations
@@ -20,6 +26,10 @@ from pathlib import Path
 import trimesh
 
 
+ScaleFactor = float | tuple[float, float, float]
+"""A uniform scale (one float) or anisotropic scale (one float per X/Y/Z)."""
+
+
 class MeshError(ValueError):
     """Raised when a mesh can't be loaded or written."""
 
@@ -27,8 +37,47 @@ class MeshError(ValueError):
 @dataclass(frozen=True)
 class ScaledMesh:
     source: Path
-    scale: float
+    scale: ScaleFactor
     output: Path
+
+
+def is_identity_scale(scale: ScaleFactor) -> bool:
+    """True if ``scale`` would leave the mesh unchanged (1.0 or (1, 1, 1))."""
+    if isinstance(scale, tuple):
+        return all(s == 1.0 for s in scale)
+    return scale == 1.0
+
+
+def _validate_scale(scale: ScaleFactor) -> None:
+    if isinstance(scale, tuple):
+        if len(scale) != 3:
+            raise MeshError(f"anisotropic scale must be a 3-tuple, got {scale!r}")
+        if any(s <= 0 for s in scale):
+            raise MeshError(f"all scale factors must be positive, got {scale!r}")
+    elif scale <= 0:
+        raise MeshError(f"scale must be positive, got {scale}")
+
+
+def _apply_scale(mesh: trimesh.Trimesh, scale: ScaleFactor) -> trimesh.Trimesh:
+    if is_identity_scale(scale):
+        return mesh
+    copy = mesh.copy()
+    if isinstance(scale, tuple):
+        copy.apply_scale(list(scale))
+    else:
+        copy.apply_scale(scale)
+    return copy
+
+
+def scale_suffix(scale: ScaleFactor) -> str:
+    """Render a filesystem-safe filename suffix for a scale.
+
+    Uniform: ``s1.0500`` (4 decimal places, lexical sort = numeric sort).
+    Anisotropic: ``s1.0200x1.0200x1.0400``.
+    """
+    if isinstance(scale, tuple):
+        return "s" + "x".join(f"{s:.4f}" for s in scale)
+    return f"s{scale:.4f}"
 
 
 def verify(source: Path) -> None:
@@ -36,19 +85,15 @@ def verify(source: Path) -> None:
     _load(source)
 
 
-def prescale(source: Path, scale: float, output: Path) -> ScaledMesh:
-    """Load ``source``, apply uniform ``scale``, write to ``output``.
+def prescale(source: Path, scale: ScaleFactor, output: Path) -> ScaledMesh:
+    """Load ``source``, apply ``scale``, write to ``output``.
 
     ``output`` is overwritten if it already exists. Parent directories are
     created as needed. Returns a ScaledMesh record describing the result.
     """
-    if scale <= 0:
-        raise MeshError(f"scale must be positive, got {scale}")
-
+    _validate_scale(scale)
     mesh = _load(source)
-    if scale != 1.0:
-        mesh = mesh.copy()
-        mesh.apply_scale(scale)
+    mesh = _apply_scale(mesh, scale)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -60,27 +105,21 @@ def prescale(source: Path, scale: float, output: Path) -> ScaledMesh:
 
 
 def prescale_many(
-    source: Path, scales: list[float], out_dir: Path
+    source: Path, scales: list[ScaleFactor], out_dir: Path
 ) -> list[ScaledMesh]:
-    """Load ``source`` once, write a scaled copy per entry in ``scales``.
-
-    Output filenames follow ``{source.stem}_s{scale:.4f}.stl``. The trailing
-    zeros let plate.py sort lexically when assembling the CLI input order.
-    """
+    """Load ``source`` once, write a scaled copy per entry in ``scales``."""
     if not scales:
         return []
-    if any(s <= 0 for s in scales):
-        raise MeshError("all scales must be positive")
+    for s in scales:
+        _validate_scale(s)
 
     mesh = _load(source)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[ScaledMesh] = []
     for scale in scales:
-        copy = mesh.copy()
-        if scale != 1.0:
-            copy.apply_scale(scale)
-        output = out_dir / f"{source.stem}_s{scale:.4f}.stl"
+        copy = _apply_scale(mesh, scale)
+        output = out_dir / f"{source.stem}_{scale_suffix(scale)}.stl"
         try:
             copy.export(output)
         except (OSError, ValueError) as e:
