@@ -33,6 +33,11 @@ dev = [
     "ruff>=0.5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/ViddySlap/bambu-prep"
+Repository = "https://github.com/ViddySlap/bambu-prep"
+Issues = "https://github.com/ViddySlap/bambu-prep/issues"
+
 [project.scripts]
 bambu-prep = "bambu_prep.cli:main"
 
