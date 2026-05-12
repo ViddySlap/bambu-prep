@@ -1,13 +1,432 @@
+"""bambu-prep CLI.
+
+Two ways to describe a plate:
+
+1. **Single-source shorthand** for the common case (one STL, N copies at
+   varying scales/slots)::
+
+       python -m bambu_prep prepare \\
+         --stl path/to/case.stl \\
+         --scales "1.02x1.02x1.04,1.023x1.023x1.045" \\
+         --slot 1 \\
+         --output out.3mf
+
+2. **JSON manifest** for heterogeneous batches (5 of A in slot 1, 3 of B
+   in slot 2, etc.)::
+
+       python -m bambu_prep prepare --manifest plate.json
+
+Diagnostics:
+
+- ``python -m bambu_prep ams-status`` - read the printer's current AMS loadout
+- ``python -m bambu_prep list-profiles machine|process|filament`` - enumerate
+  installed Bambu Studio presets
+
+Defaults read from ``bambu_prep_config.toml``; CLI flags override the config.
+Live AMS query is mandatory; if the printer is unreachable, the command
+aborts with a clear message instead of falling back to a manual prompt
+(this keeps the command identical when invoked by an agent like OpenClaw).
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess  # noqa: F401 (used in _launch_studio when --open is given)
+import sys
+from datetime import date
+from pathlib import Path
+
 import click
+
+from bambu_prep.ams import (
+    AMSError,
+    _default_live_query,
+    filament_suffix_for,
+    get_ams_state,
+    match_preset,
+)
+from bambu_prep.config import Config, load_config
+from bambu_prep.meshes import ScaleFactor
+from bambu_prep.plate import PlateItem, PrepareError, prepare_plate
+from bambu_prep.profiles import ProfileError, list_profiles
+
+
+WINDOWS_DROPBOX_DEFAULT = Path(
+    "D:/Baros Design Co. Dropbox/Ben Baros/AI AGENTS/3D PRINTING"
+)
+"""Hardcoded fallback when config doesn't specify ``defaults.output_dir``.
+Override per-invocation with ``--output`` or per-environment via the config
+file's ``[defaults]`` section (which OpenClaw on the server should populate
+with its own path)."""
 
 
 @click.group()
 def main() -> None:
-    """bambu-prep: build unsliced .3mf plates for Bambu Studio."""
+    """bambu-prep: build unsliced Bambu Studio .3mf plates."""
 
 
 @main.command()
 def version() -> None:
+    """Print the installed version."""
     from bambu_prep import __version__
 
     click.echo(__version__)
+
+
+@main.command()
+@click.option(
+    "--stl",
+    "stl_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Single-source: input STL or .3mf path.",
+)
+@click.option(
+    "--scales",
+    "scales_str",
+    type=str,
+    default="",
+    help='Single-source: comma-separated scale list. Uniform "1.02" or '
+    'anisotropic "1.02x1.02x1.04". Empty = identity scale.',
+)
+@click.option(
+    "--slot",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Single-source: AMS slot for every copy.",
+)
+@click.option(
+    "--count",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Single-source: number of copies per scale.",
+)
+@click.option(
+    "--manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Multi-source: JSON manifest. Mutually exclusive with --stl/--scales.",
+)
+@click.option(
+    "--machine",
+    default=None,
+    help="Machine preset name. Default from config; falls back to "
+    '"Bambu Lab A1 0.4 nozzle".',
+)
+@click.option(
+    "--process",
+    "process_profile",
+    default=None,
+    help="Process preset name. Default from config; falls back to "
+    '"0.20mm Standard @BBL A1".',
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Output .3mf path. Default: <output_dir>/<auto-name>.3mf",
+)
+@click.option(
+    "--subfolder",
+    default="",
+    help="Optional subfolder under the default output dir (e.g. project slug).",
+)
+@click.option(
+    "--open",
+    "auto_open",
+    is_flag=True,
+    default=False,
+    help="Launch Bambu Studio with the generated file. Desktop-only; "
+    "the skill leaves this off by default so the command works on a "
+    "headless agent (OpenClaw) too.",
+)
+def prepare(
+    stl_path: Path | None,
+    scales_str: str,
+    slot: int,
+    count: int,
+    manifest: Path | None,
+    machine: str | None,
+    process_profile: str | None,
+    output_path: Path | None,
+    subfolder: str,
+    auto_open: bool,
+) -> None:
+    """Build an unsliced .3mf plate for Bambu Studio."""
+    config = load_config()
+
+    if manifest and (stl_path or scales_str):
+        raise click.UsageError(
+            "--manifest is mutually exclusive with --stl / --scales"
+        )
+
+    if manifest:
+        items, manifest_machine, manifest_process, manifest_output = _items_from_manifest(
+            manifest
+        )
+        machine = machine or manifest_machine
+        process_profile = process_profile or manifest_process
+        output_path = output_path or manifest_output
+    elif stl_path:
+        items = _items_from_flags(stl_path, scales_str, slot, count)
+    else:
+        raise click.UsageError("provide --stl + --scales, or --manifest")
+
+    if not items:
+        raise click.UsageError("no items to print (resolved item list is empty)")
+
+    machine = machine or config.defaults.machine_profile
+    process_profile = process_profile or config.defaults.process_profile
+
+    if output_path is None:
+        output_path = _default_output_path(items, config, subfolder)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    slots_needed = {item.ams_slot for item in items}
+    try:
+        ams_state = _live_ams_or_fail(config, machine, slots_needed)
+    except AMSError as e:
+        click.echo(f"ams: {e}", err=True)
+        sys.exit(2)
+
+    try:
+        result = prepare_plate(
+            items=items,
+            machine_profile=machine,
+            process_profile=process_profile,
+            output_path=output_path,
+            ams_state=ams_state,
+            config=config,
+        )
+    except (PrepareError, ProfileError) as e:
+        click.echo(f"prepare: {e}", err=True)
+        sys.exit(2)
+
+    click.echo(
+        f"fit={result.fit} requested={result.requested} dropped={len(result.dropped)}"
+    )
+    if result.dropped:
+        click.echo("dropped (lowest priority first):")
+        for it in result.dropped:
+            click.echo(f"  - {it.stl_path.name} scale={it.scale} slot={it.ams_slot}")
+    if result.output_path is None:
+        click.echo("no .3mf produced (every item dropped)", err=True)
+        sys.exit(3)
+
+    click.echo(f"output: {result.output_path}")
+
+    if auto_open:
+        _launch_studio(config.paths.bambu_studio_exe, result.output_path)
+
+
+@main.command(name="ams-status")
+@click.option("--machine", default=None, help="Machine preset name for filament matching.")
+def ams_status(machine: str | None) -> None:
+    """Print the printer's current AMS slot loadout.
+
+    Reports every populated slot with its matched filament preset (or a
+    descriptive label when the printer's RFID hint doesn't map to a single
+    preset). Empty slots are listed as empty. Exits non-zero only when the
+    printer can't be reached at all.
+    """
+    config = load_config()
+    machine = machine or config.defaults.machine_profile
+
+    if not config.printer.ip:
+        click.echo(
+            "ams: no printer ip in config; populate [printer] or [secret_refs] "
+            "in bambu_prep_config.toml",
+            err=True,
+        )
+        sys.exit(2)
+
+    trays = _default_live_query(config)
+    if trays is None:
+        click.echo(
+            f"ams: printer unreachable at {config.printer.ip}. Power on the A1, "
+            "verify it's on the network, and that LAN Only Mode + Developer Mode "
+            "are still enabled.",
+            err=True,
+        )
+        sys.exit(2)
+
+    suffix = filament_suffix_for(machine)
+    available = [p.name for p in list_profiles(config, "filament")]
+
+    if not trays:
+        click.echo("AMS connected; no slots populated")
+        return
+
+    for slot in range(1, 5):
+        tray = trays.get(slot)
+        if tray is None:
+            click.echo(f"  slot {slot}: <empty>")
+            continue
+        matched = match_preset(tray, suffix, available)
+        if matched:
+            click.echo(f"  slot {slot}: {matched}  (color #{tray.color})")
+        else:
+            label = tray.sub_brand or tray.name_hint or "<unknown>"
+            click.echo(
+                f"  slot {slot}: {label}  (color #{tray.color}; no preset match for {suffix!r})"
+            )
+
+
+@main.command(name="list-profiles")
+@click.argument("kind", type=click.Choice(["machine", "process", "filament"]))
+@click.option("--filter", "filter_str", default="", help="Substring filter (case-insensitive).")
+def list_profiles_cmd(kind: str, filter_str: str) -> None:
+    """List installed Bambu Studio profiles of the given kind."""
+    config = load_config()
+    profiles = list_profiles(config, kind)
+    if filter_str:
+        needle = filter_str.lower()
+        profiles = [p for p in profiles if needle in p.name.lower()]
+    for p in profiles:
+        click.echo(f"  [{p.source}] {p.name}")
+
+
+def _items_from_flags(
+    stl_path: Path, scales_str: str, slot: int, count: int
+) -> list[PlateItem]:
+    if not scales_str.strip():
+        return [PlateItem(stl_path=stl_path, scale=1.0, ams_slot=slot) for _ in range(count)]
+    scales = [_parse_scale(s) for s in scales_str.split(",")]
+    items: list[PlateItem] = []
+    for scale in scales:
+        for _ in range(count):
+            items.append(PlateItem(stl_path=stl_path, scale=scale, ams_slot=slot))
+    return items
+
+
+def _parse_scale(s: str) -> ScaleFactor:
+    s = s.strip()
+    if not s:
+        raise click.BadParameter("empty scale value")
+    if "x" in s:
+        parts = s.split("x")
+        if len(parts) != 3:
+            raise click.BadParameter(
+                f"anisotropic scale must be 3 axis-values, got {s!r}"
+            )
+        try:
+            return tuple(float(p) for p in parts)  # type: ignore[return-value]
+        except ValueError as e:
+            raise click.BadParameter(f"bad anisotropic scale {s!r}: {e}") from e
+    try:
+        return float(s)
+    except ValueError as e:
+        raise click.BadParameter(f"bad scale {s!r}: {e}") from e
+
+
+def _items_from_manifest(
+    manifest_path: Path,
+) -> tuple[list[PlateItem], str | None, str | None, Path | None]:
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if "items" not in raw or not isinstance(raw["items"], list):
+        raise click.UsageError(f"{manifest_path}: manifest must have an 'items' array")
+    items: list[PlateItem] = []
+    for i, entry in enumerate(raw["items"]):
+        if not isinstance(entry, dict) or "stl" not in entry:
+            raise click.UsageError(
+                f"{manifest_path} item #{i}: each item needs an 'stl' path"
+            )
+        stl = Path(entry["stl"])
+        scale_raw = entry.get("scale", 1.0)
+        if isinstance(scale_raw, list):
+            if len(scale_raw) != 3:
+                raise click.UsageError(
+                    f"{manifest_path} item #{i}: anisotropic scale must be 3 values"
+                )
+            scale: ScaleFactor = tuple(float(x) for x in scale_raw)  # type: ignore[assignment]
+        else:
+            scale = float(scale_raw)
+        slot = int(entry.get("slot", 1))
+        n = int(entry.get("count", 1))
+        if n < 1:
+            raise click.UsageError(f"{manifest_path} item #{i}: count must be >= 1")
+        for _ in range(n):
+            items.append(PlateItem(stl_path=stl, scale=scale, ams_slot=slot))
+
+    machine = raw.get("machine_profile")
+    process = raw.get("process_profile")
+    output = Path(raw["output_path"]) if "output_path" in raw else None
+    return items, machine, process, output
+
+
+def _default_output_path(
+    items: list[PlateItem], config: Config, subfolder: str
+) -> Path:
+    base = config.defaults.output_dir or WINDOWS_DROPBOX_DEFAULT
+    if subfolder:
+        base = base / subfolder
+    today = date.today().isoformat()
+    distinct_sources = {it.stl_path.stem for it in items}
+    if len(distinct_sources) == 1:
+        stem = next(iter(distinct_sources))
+    else:
+        stem = "plate"
+    return base / f"{stem}_{len(items)}copies_{today}.3mf"
+
+
+def _live_ams_or_fail(
+    config: Config,
+    machine: str,
+    slots_needed: set[int],
+    *,
+    allow_missing_slots: bool = False,
+) -> dict[int, str]:
+    """Wrap get_ams_state so unreachable printer aborts with a clear message
+    instead of falling through to interactive prompt."""
+    if not config.printer.ip:
+        raise AMSError(
+            "no printer ip in config; populate [printer] in bambu_prep_config.toml "
+            "or set BAMBU_A1_IP via [secret_refs]"
+        )
+
+    captured: dict[str, object] = {}
+
+    def fail_loud(slots, detected, suggestions):
+        captured["slots"] = sorted(slots)
+        captured["detected_present"] = detected is not None
+        return {}  # signals "couldn't resolve"
+
+    if allow_missing_slots:
+        state = get_ams_state(
+            slots_needed,
+            config=config,
+            machine_profile_name=machine,
+            interactive=lambda *_: {},
+        )
+        return state
+
+    state = get_ams_state(
+        slots_needed,
+        config=config,
+        machine_profile_name=machine,
+        interactive=fail_loud,
+    )
+    missing = slots_needed - state.keys()
+    if missing:
+        if captured.get("detected_present"):
+            raise AMSError(
+                f"printer reached but slots {sorted(missing)} could not be matched "
+                "to an installed filament preset. Check the loaded filaments or "
+                "use --manifest with an explicit slot/filament map."
+            )
+        raise AMSError(
+            f"printer unreachable at {config.printer.ip} (slots needed: "
+            f"{sorted(slots_needed)}). Power on the A1, verify it's on the "
+            "network, and that LAN Only Mode + Developer Mode are still enabled."
+        )
+    return state
+
+
+def _launch_studio(exe: Path, threempf_path: Path) -> None:
+    if not exe.is_file():
+        click.echo(f"--open: bambu-studio.exe not at {exe}; skipping launch", err=True)
+        return
+    try:
+        subprocess.Popen([str(exe), str(threempf_path)])
+    except OSError as e:
+        click.echo(f"--open: failed to launch Studio: {e}", err=True)

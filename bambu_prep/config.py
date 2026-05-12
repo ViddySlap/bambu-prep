@@ -52,10 +52,18 @@ class Behavior:
 
 
 @dataclass(frozen=True)
+class Defaults:
+    output_dir: Path | None = None
+    machine_profile: str = "Bambu Lab A1 0.4 nozzle"
+    process_profile: str = "0.20mm Standard @BBL A1"
+
+
+@dataclass(frozen=True)
 class Config:
     paths: Paths = field(default_factory=Paths)
     printer: Printer = field(default_factory=Printer)
     behavior: Behavior = field(default_factory=Behavior)
+    defaults: Defaults = field(default_factory=Defaults)
     source_path: Path | None = None
 
 
@@ -111,12 +119,19 @@ def _build_config(raw: dict, *, source_path: Path | None, env: dict[str, str]) -
     paths = _build_paths(raw.get("paths", {}))
     printer = _build_printer(raw.get("printer", {}))
     behavior = _build_behavior(raw.get("behavior", {}))
+    defaults = _build_defaults(raw.get("defaults", {}))
 
     secret_refs = raw.get("secret_refs", {})
     if secret_refs:
         printer = _apply_secret_refs(printer, secret_refs, env)
 
-    return Config(paths=paths, printer=printer, behavior=behavior, source_path=source_path)
+    return Config(
+        paths=paths,
+        printer=printer,
+        behavior=behavior,
+        defaults=defaults,
+        source_path=source_path,
+    )
 
 
 def _build_paths(section: dict) -> Paths:
@@ -145,6 +160,15 @@ def _build_behavior(section: dict) -> Behavior:
         allow_rotations=bool(section.get("allow_rotations", defaults.allow_rotations)),
         ensure_on_bed=bool(section.get("ensure_on_bed", defaults.ensure_on_bed)),
         allow_mix_temp=bool(section.get("allow_mix_temp", defaults.allow_mix_temp)),
+    )
+
+
+def _build_defaults(section: dict) -> Defaults:
+    base = Defaults()
+    return Defaults(
+        output_dir=_optional_path(section.get("output_dir")),
+        machine_profile=str(section.get("machine_profile", base.machine_profile)),
+        process_profile=str(section.get("process_profile", base.process_profile)),
     )
 
 
