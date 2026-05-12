@@ -24,6 +24,7 @@ dependencies = [
     "numpy>=1.26",
     "click>=8.1",
     "bambulabs-api>=2.4",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]

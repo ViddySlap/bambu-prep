@@ -46,6 +46,14 @@ from bambu_prep.ams import (
     match_preset,
 )
 from bambu_prep.config import Config, load_config
+from bambu_prep.dispatch import (
+    DispatchError,
+    PreflightReport,
+    preflight as dispatch_preflight,
+    start as dispatch_start,
+    upload as dispatch_upload,
+)
+from bambu_prep.makerworld import MakerWorldError, fetch as makerworld_fetch
 from bambu_prep.meshes import ScaleFactor
 from bambu_prep.plate import PlateItem, PrepareError, prepare_plate
 from bambu_prep.profiles import ProfileError, list_profiles
@@ -272,6 +280,184 @@ def ams_status(machine: str | None) -> None:
             )
 
 
+@main.command()
+@click.argument("url", type=str)
+@click.option(
+    "--subfolder",
+    default="",
+    help="Optional subfolder under the default output dir for the downloaded file.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Explicit output .3mf path. Default: <output_dir>/<subfolder>/<sanitized-name>.3mf",
+)
+def fetch(url: str, subfolder: str, output_path: Path | None) -> None:
+    """Download a curated .3mf from a MakerWorld URL.
+
+    Auth is automatic: a Bambu Cloud token is resolved via the local cache,
+    then Bambu Studio's installed cache, then programmatic login using
+    ``BAMBU_CLOUD_EMAIL`` / ``BAMBU_CLOUD_PASSWORD`` env vars.
+
+    Example:
+
+        python -m bambu_prep fetch \\
+          "https://makerworld.com/en/models/707208-clicker-fidget?from=x#profileId-637253"
+    """
+    config = load_config()
+    try:
+        if output_path is None:
+            base = config.defaults.output_dir or WINDOWS_DROPBOX_DEFAULT
+            if subfolder:
+                base = base / subfolder
+            # Resolve the maker's filename via a no-write probe: we don't have it
+            # yet, so use a placeholder; makerworld_fetch returns the real name and
+            # we rename after download.
+            base.mkdir(parents=True, exist_ok=True)
+            today = date.today().isoformat()
+            output_path = base / f"makerworld_{today}.3mf"
+        result = makerworld_fetch(url, output_path=output_path)
+    except MakerWorldError as e:
+        click.echo(f"fetch: {e}", err=True)
+        sys.exit(2)
+
+    # Rename to a clean, name-based filename now that we know what the maker called it.
+    final_path = result.path
+    if output_path.name.startswith("makerworld_"):
+        safe = _sanitize_filename(result.name)
+        renamed = output_path.with_name(f"{safe}_{date.today().isoformat()}.3mf")
+        if renamed != output_path:
+            # Use replace() not rename() so an existing target (e.g. from a prior
+            # partial run) is overwritten rather than crashing on Windows.
+            output_path.replace(renamed)
+            final_path = renamed
+
+    click.echo(f"name: {result.name}")
+    click.echo(f"design_id: {result.design_id}")
+    click.echo(f"instance_id: {result.instance_id}")
+    click.echo(f"profile_id: {result.profile_id}  (resolved slicer profile)")
+    click.echo(f"output: {final_path}")
+
+
+@main.command()
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--plate",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Plate number (1-indexed) within the .3mf to print.",
+)
+@click.option(
+    "--ams-mapping",
+    "ams_mapping_str",
+    default="",
+    help="Comma-separated 0-indexed AMS slots for each filament in the .3mf. "
+    'Default: natural mapping ([0,1,...]). Example: "2,0" maps filament 1 to slot 3, filament 2 to slot 1.',
+)
+@click.option(
+    "--start",
+    "do_start",
+    is_flag=True,
+    default=False,
+    help="Actually start the print after upload + preflight. Default: stop after "
+    "preflight (the skill calls this command twice: once without --start to show "
+    "the preflight, then again with --start after the user confirms).",
+)
+@click.option(
+    "--no-ams",
+    "no_ams",
+    is_flag=True,
+    default=False,
+    help="Disable AMS for this print (single-spool feed instead).",
+)
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    default=False,
+    help="Skip preflight (AMS compatibility check). Use ONLY when you know the AMS "
+    "state is correct independently. Workaround for bambulabs-api MQTT state issues "
+    "when upload + preflight happen back-to-back in the same process.",
+)
+def send(
+    file_path: Path,
+    plate: int,
+    ams_mapping_str: str,
+    do_start: bool,
+    no_ams: bool,
+    skip_preflight: bool,
+) -> None:
+    """Upload a sliced .3mf to the A1, run preflight, and optionally start the print.
+
+    Default behavior (no ``--start``):
+
+    1. Upload the .3mf to the printer over FTPS.
+    2. Run preflight: compare what the print needs against the live AMS state.
+    3. Print the preflight summary and exit. The skill (or a human) reviews,
+       then re-invokes with ``--start`` to actually kick off the print.
+
+    With ``--start``: same as above plus issue the start-print command.
+    """
+    config = load_config()
+
+    ams_mapping = _parse_ams_mapping(ams_mapping_str) if ams_mapping_str else None
+
+    try:
+        remote_name = dispatch_upload(file_path, config=config)
+    except DispatchError as e:
+        click.echo(f"send: {e}", err=True)
+        sys.exit(2)
+    click.echo(f"uploaded: {remote_name}")
+
+    if skip_preflight:
+        click.echo("preflight: SKIPPED (--skip-preflight passed)")
+        if not do_start:
+            click.echo("upload complete; re-run with --start to begin the print")
+            return
+        # Default mapping when preflight is skipped: 0-indexed natural mapping.
+        # If --ams-mapping was passed, honor it; else [0] for single-filament.
+        final_mapping = ams_mapping if ams_mapping is not None else [0]
+    else:
+        # The A1's MQTT broker needs a moment to release the client slot after
+        # upload's mqtt_stop() before preflight's fresh MQTT query can succeed.
+        # 15s empirically sufficient; 3s wasn't.
+        import time as _time
+        _time.sleep(15.0)
+
+        try:
+            report = dispatch_preflight(file_path, config=config, ams_mapping=ams_mapping)
+        except DispatchError as e:
+            click.echo(f"send: {e}", err=True)
+            sys.exit(2)
+        click.echo(report.human_summary())
+
+        if not do_start:
+            if not report.ok:
+                click.echo("preflight: NOT ok; resolve issues before passing --start", err=True)
+                sys.exit(3)
+            click.echo("preflight: ok; re-run with --start to begin the print")
+            return
+
+        if not report.ok:
+            click.echo("send: preflight failed; refusing to start", err=True)
+            sys.exit(3)
+        final_mapping = report.ams_mapping
+
+    try:
+        dispatch_start(
+            remote_name,
+            config=config,
+            plate=plate,
+            ams_mapping=final_mapping,
+            use_ams=not no_ams,
+        )
+    except DispatchError as e:
+        click.echo(f"send: {e}", err=True)
+        sys.exit(2)
+    click.echo(f"started: {remote_name} plate {plate}")
+
+
 @main.command(name="list-profiles")
 @click.argument("kind", type=click.Choice(["machine", "process", "filament"]))
 @click.option("--filter", "filter_str", default="", help="Substring filter (case-insensitive).")
@@ -420,6 +606,32 @@ def _live_ams_or_fail(
             "network, and that LAN Only Mode + Developer Mode are still enabled."
         )
     return state
+
+
+def _sanitize_filename(name: str) -> str:
+    """Strip path separators and Windows-illegal characters from a filename."""
+    import re
+
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip()
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned or "makerworld"
+
+
+def _parse_ams_mapping(s: str) -> list[int]:
+    """Parse a comma-separated 0-indexed AMS-slot mapping like '2,0,1'."""
+    out: list[int] = []
+    for piece in s.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            v = int(piece)
+        except ValueError as e:
+            raise click.BadParameter(f"ams-mapping must be ints, got {piece!r}") from e
+        if v < 0:
+            raise click.BadParameter(f"ams-mapping values must be >= 0, got {v}")
+        out.append(v)
+    return out
 
 
 def _launch_studio(exe: Path, threempf_path: Path) -> None:
