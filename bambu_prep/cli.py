@@ -55,6 +55,11 @@ from bambu_prep.dispatch import (
     validate_file as dispatch_validate_file,
 )
 from bambu_prep.makerworld import MakerWorldError, fetch as makerworld_fetch
+from bambu_prep.retarget import (
+    RetargetError,
+    RetargetResult,
+    retarget as retarget_3mf,
+)
 from bambu_prep.meshes import ScaleFactor
 from bambu_prep.plate import PlateItem, PrepareError, prepare_plate
 from bambu_prep.profiles import ProfileError, list_profiles
@@ -294,7 +299,17 @@ def ams_status(machine: str | None) -> None:
     type=click.Path(dir_okay=False, path_type=Path),
     help="Explicit output .3mf path. Default: <output_dir>/<subfolder>/<sanitized-name>.3mf",
 )
-def fetch(url: str, subfolder: str, output_path: Path | None) -> None:
+@click.option(
+    "--no-retarget",
+    is_flag=True,
+    default=False,
+    help="Skip the post-download retarget step. By default, every fetched .3mf "
+    "is unconditionally retargeted to the A1 (Bambu Lab A1 0.4 nozzle + "
+    "Bambu PLA Basic @BBL A1 + N2S model_id) so the file opens A1-ready in "
+    "Studio. Use this flag only when intentionally keeping the maker's "
+    "profile (rare; e.g. you're forwarding the file to a different printer).",
+)
+def fetch(url: str, subfolder: str, output_path: Path | None, no_retarget: bool) -> None:
     """Download a curated .3mf from a MakerWorld URL.
 
     Auth is automatic: a Bambu Cloud token is resolved via the local cache,
@@ -339,6 +354,30 @@ def fetch(url: str, subfolder: str, output_path: Path | None) -> None:
     click.echo(f"instance_id: {result.instance_id}")
     click.echo(f"profile_id: {result.profile_id}  (resolved slicer profile)")
     click.echo(f"output: {final_path}")
+
+    if not no_retarget:
+        try:
+            rt = retarget_3mf(final_path, config=config)
+        except RetargetError as e:
+            click.echo(f"fetch: retarget failed: {e}", err=True)
+            click.echo(
+                "fetch: file downloaded successfully but was not retargeted to the A1. "
+                "Re-run `python -m bambu_prep retarget <path>` to fix, or open in "
+                "Studio and switch the printer manually.",
+                err=True,
+            )
+            return
+        if rt.was_already_target:
+            click.echo(
+                "retarget: file was already targeting the A1; no changes needed."
+            )
+        else:
+            click.echo(
+                f"retarget: rewrote {rt.fields_changed} field(s) to "
+                f"target '{rt.target_machine}' (model_id={rt.target_machine_model_id}) "
+                f"with filament '{rt.target_filament}'. Open in Studio and the "
+                "printer selector will read 'Bambu Lab A1' already."
+            )
 
 
 @main.command()
@@ -494,6 +533,78 @@ def send(
         click.echo(f"send: {e}", err=True)
         sys.exit(2)
     click.echo(f"started: {remote_name} plate {plate}")
+
+
+@main.command()
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output path. Default: rewrite in place.",
+)
+@click.option(
+    "--machine",
+    "target_machine",
+    default="Bambu Lab A1 0.4 nozzle",
+    show_default=True,
+    help="Target machine profile.",
+)
+@click.option(
+    "--filament",
+    "target_filament",
+    default="Bambu PLA Basic @BBL A1",
+    show_default=True,
+    help="Target filament profile (applied to every AMS slot).",
+)
+@click.option(
+    "--model-id",
+    "target_model_id",
+    default="N2S",
+    show_default=True,
+    help="Target printer_model_id written into slice_info.config (A1 = N2S).",
+)
+def retarget(
+    file_path: Path,
+    output_path: Path | None,
+    target_machine: str,
+    target_filament: str,
+    target_model_id: str,
+) -> None:
+    """Rewrite a .3mf to unconditionally target the A1 (or another machine).
+
+    Patches Metadata/project_settings.config so the printer_model, every
+    machine-bound setting (start_gcode, bed_exclude_area, max speeds, etc.),
+    and every filament_settings_id slot all reference the target A1 profile.
+    Process-bound settings (layer_height, infill, supports, etc.) are
+    preserved from the input.
+
+    Use this when receiving a .3mf from outside the fetch path (e.g. a file
+    a friend sent you, or one you re-downloaded manually). Files coming
+    through `python -m bambu_prep fetch` are retargeted automatically.
+    """
+    config = load_config()
+    try:
+        result = retarget_3mf(
+            file_path,
+            config=config,
+            output_path=output_path,
+            target_machine_profile=target_machine,
+            target_filament_profile=target_filament,
+            target_machine_model_id=target_model_id,
+        )
+    except RetargetError as e:
+        click.echo(f"retarget: {e}", err=True)
+        sys.exit(2)
+
+    if result.was_already_target:
+        click.echo(f"retarget: {file_path.name} already targets {target_machine}; no changes.")
+        return
+    click.echo(
+        f"retarget: rewrote {result.fields_changed} field(s) in {result.output_path.name} "
+        f"to target '{result.target_machine}' (model_id={result.target_machine_model_id})."
+    )
 
 
 @main.command(name="list-profiles")
