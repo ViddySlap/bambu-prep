@@ -372,12 +372,21 @@ def fetch(url: str, subfolder: str, output_path: Path | None) -> None:
     default=False,
     help="Disable AMS for this print (single-spool feed instead).",
 )
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    default=False,
+    help="Skip preflight (AMS compatibility check). Use ONLY when you know the AMS "
+    "state is correct independently. Workaround for bambulabs-api MQTT state issues "
+    "when upload + preflight happen back-to-back in the same process.",
+)
 def send(
     file_path: Path,
     plate: int,
     ams_mapping_str: str,
     do_start: bool,
     no_ams: bool,
+    skip_preflight: bool,
 ) -> None:
     """Upload a sliced .3mf to the A1, run preflight, and optionally start the print.
 
@@ -401,30 +410,46 @@ def send(
         sys.exit(2)
     click.echo(f"uploaded: {remote_name}")
 
-    try:
-        report = dispatch_preflight(file_path, config=config, ams_mapping=ams_mapping)
-    except DispatchError as e:
-        click.echo(f"send: {e}", err=True)
-        sys.exit(2)
-    click.echo(report.human_summary())
+    if skip_preflight:
+        click.echo("preflight: SKIPPED (--skip-preflight passed)")
+        if not do_start:
+            click.echo("upload complete; re-run with --start to begin the print")
+            return
+        # Default mapping when preflight is skipped: 0-indexed natural mapping.
+        # If --ams-mapping was passed, honor it; else [0] for single-filament.
+        final_mapping = ams_mapping if ams_mapping is not None else [0]
+    else:
+        # The A1's MQTT broker needs a moment to release the client slot after
+        # upload's mqtt_stop() before preflight's fresh MQTT query can succeed.
+        # 15s empirically sufficient; 3s wasn't.
+        import time as _time
+        _time.sleep(15.0)
 
-    if not do_start:
+        try:
+            report = dispatch_preflight(file_path, config=config, ams_mapping=ams_mapping)
+        except DispatchError as e:
+            click.echo(f"send: {e}", err=True)
+            sys.exit(2)
+        click.echo(report.human_summary())
+
+        if not do_start:
+            if not report.ok:
+                click.echo("preflight: NOT ok; resolve issues before passing --start", err=True)
+                sys.exit(3)
+            click.echo("preflight: ok; re-run with --start to begin the print")
+            return
+
         if not report.ok:
-            click.echo("preflight: NOT ok; resolve issues before passing --start", err=True)
+            click.echo("send: preflight failed; refusing to start", err=True)
             sys.exit(3)
-        click.echo("preflight: ok; re-run with --start to begin the print")
-        return
-
-    if not report.ok:
-        click.echo("send: preflight failed; refusing to start", err=True)
-        sys.exit(3)
+        final_mapping = report.ams_mapping
 
     try:
         dispatch_start(
             remote_name,
             config=config,
             plate=plate,
-            ams_mapping=report.ams_mapping,
+            ams_mapping=final_mapping,
             use_ams=not no_ams,
         )
     except DispatchError as e:
