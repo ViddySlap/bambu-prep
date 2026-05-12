@@ -107,6 +107,7 @@ def retarget(
     config: Config,
     output_path: Path | None = None,
     target_machine_profile: str = "Bambu Lab A1 0.4 nozzle",
+    target_process_profile: str = "0.20mm Standard @BBL A1",
     target_filament_profile: str = "Bambu PLA Basic @BBL A1",
     target_machine_model_id: str = "N2S",
     target_machine_model: str = "Bambu Lab A1",
@@ -123,6 +124,12 @@ def retarget(
 
     try:
         machine_profile = resolve(config, "machine", target_machine_profile)
+        # Validate the process profile exists but don't merge its fields.
+        # We only flip the print_settings_id identifier; the maker's actual
+        # process tuning (layer_height, infill, supports, etc.) stays as-is
+        # because those are printer-agnostic and the maker may have spent
+        # effort tuning them.
+        resolve(config, "process", target_process_profile)
         filament_profile = resolve(config, "filament", target_filament_profile)
     except ProfileError as e:
         raise RetargetError(f"could not resolve target profile: {e}") from e
@@ -158,6 +165,7 @@ def retarget(
         filament_fields=filament_fields,
         target_machine_model=target_machine_model,
         target_printer_settings_id=target_machine_profile,
+        target_print_settings_id=target_process_profile,
         target_filament_settings_id=target_filament_profile,
     )
 
@@ -267,6 +275,7 @@ def _patch_project_settings(
     filament_fields: dict,
     target_machine_model: str,
     target_printer_settings_id: str,
+    target_print_settings_id: str,
     target_filament_settings_id: str,
 ) -> int:
     """Mutate ``ps`` in place. Return the number of fields whose value changed."""
@@ -301,10 +310,16 @@ def _patch_project_settings(
                 changed += 1
 
     # Identity fields. These are what Studio reads to decide "which printer
-    # is selected" when the file is opened.
+    # is selected" when the file is opened. print_settings_id is the
+    # process-profile identifier (e.g. "0.20mm Standard @BBL A1"); leaving
+    # the maker's X1C value there makes Studio's CLI emit lookup warnings
+    # and may contribute to slice-mode crashes when the X1C profile file
+    # isn't installed locally.
     if _set_if_different(ps, "printer_model", target_machine_model):
         changed += 1
     if _set_if_different(ps, "printer_settings_id", target_printer_settings_id):
+        changed += 1
+    if _set_if_different(ps, "print_settings_id", target_print_settings_id):
         changed += 1
 
     new_filament_ids = [target_filament_settings_id] * n_filaments
@@ -316,6 +331,35 @@ def _patch_project_settings(
     # is the target.
     if _set_if_different(ps, "print_compatible_printers", [target_printer_settings_id]):
         changed += 1
+
+    # ``inherits_group`` is a Studio metadata field that records the
+    # profile lineage. When the maker had X1C selected, the first entry
+    # carries the X1C process name; the CLI emits a "can not find system
+    # preset file" warning trying to load process_full/<that name>.json.
+    # Cosmetic, but worth fixing for clean diagnostics. Shape is
+    # [process, filament[0..n-1], machine] in practice; set the first to
+    # the target process and the last to the target machine, blank in
+    # between (or len-aware if we can detect filament count).
+    cur_inherits = ps.get("inherits_group")
+    if isinstance(cur_inherits, list) and len(cur_inherits) >= 2:
+        # Replace any non-empty entries that look like a process/machine
+        # profile name with the target equivalents. Empty entries stay
+        # empty (those slots are for unspecified filaments).
+        new_inherits = list(cur_inherits)
+        for i, entry in enumerate(new_inherits):
+            if not isinstance(entry, str) or not entry:
+                continue
+            # Heuristic: first non-empty entry is the process inherit
+            # (e.g. "0.20mm Standard @BBL X1C"). Later entries can be
+            # filament or machine inherits. We only know the first
+            # safely — replace it with the target process; clear the rest
+            # to avoid carrying maker-printer-specific names forward.
+            if i == 0:
+                new_inherits[i] = target_print_settings_id
+            else:
+                new_inherits[i] = ""
+        if _set_if_different(ps, "inherits_group", new_inherits):
+            changed += 1
 
     return changed
 

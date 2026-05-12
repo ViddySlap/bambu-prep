@@ -552,6 +552,14 @@ def send(
     help="Target machine profile.",
 )
 @click.option(
+    "--process",
+    "target_process",
+    default="0.20mm Standard @BBL A1",
+    show_default=True,
+    help="Target process profile (only the identifier is flipped; the maker's "
+    "actual layer-height/infill/supports tuning is preserved).",
+)
+@click.option(
     "--filament",
     "target_filament",
     default="Bambu PLA Basic @BBL A1",
@@ -569,6 +577,7 @@ def retarget(
     file_path: Path,
     output_path: Path | None,
     target_machine: str,
+    target_process: str,
     target_filament: str,
     target_model_id: str,
 ) -> None:
@@ -591,6 +600,7 @@ def retarget(
             config=config,
             output_path=output_path,
             target_machine_profile=target_machine,
+            target_process_profile=target_process,
             target_filament_profile=target_filament,
             target_machine_model_id=target_model_id,
         )
