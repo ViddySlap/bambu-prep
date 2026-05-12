@@ -34,6 +34,14 @@ from bambu_prep.config import Config
 SLICE_INFO_MEMBER = "Metadata/slice_info.config"
 MODEL_SETTINGS_MEMBER = "Metadata/model_settings.config"
 
+DEFAULT_A1_MODEL_ID = "N2S"
+"""Bambu Studio's identifier for the Bambu Lab A1 in
+``Metadata/slice_info.config``'s ``printer_model_id`` field. Matches the
+``model_id`` in ``resources/profiles/BBL/machine/Bambu Lab A1.json``. The
+X1 Carbon is ``BL-P001``, A1 mini is ``N1``, etc. A wrong id here means
+the .3mf was sliced for a different machine and will produce broken
+gcode on the A1 (no bed leveling, mid-air extrusion in the worst case)."""
+
 
 @dataclass(frozen=True)
 class FilamentRequirement:
@@ -98,6 +106,112 @@ class PreflightReport:
         for w in self.warnings:
             lines.append(f"  ! {w}")
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class FileValidation:
+    """Static-file checks on a .3mf before dispatch (no printer needed).
+
+    Catches two failure modes that ``preflight`` (which only inspects AMS
+    state) can't see:
+
+    - the file isn't actually sliced (no ``Metadata/plate_<n>.gcode``);
+    - the file was sliced for the wrong printer (``printer_model_id``
+      inside ``slice_info.config`` doesn't match the target machine).
+
+    The CLI ``send`` subcommand runs this before uploading.
+    """
+
+    sliced: bool
+    detected_model_id: str
+    expected_model_id: str
+    plate: int
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    @property
+    def model_id_match(self) -> bool:
+        return self.detected_model_id == self.expected_model_id
+
+
+_PRINTER_MODEL_ID_RE = re.compile(
+    r'key\s*=\s*"printer_model_id"\s+value\s*=\s*"([^"]*)"',
+    re.IGNORECASE,
+)
+
+
+def validate_file(
+    file_path: Path,
+    *,
+    plate: int = 1,
+    expected_printer_model_id: str = DEFAULT_A1_MODEL_ID,
+    allow_printer_mismatch: bool = False,
+) -> FileValidation:
+    """Inspect a .3mf zip and report whether it's safe to send to the A1.
+
+    Two hard-fail conditions (recorded in ``errors``):
+
+    - ``Metadata/plate_<plate>.gcode`` missing inside the zip. A "Save
+      Project" export looks sliced (it has ``slice_info.config``) but
+      contains no gcode; the printer can't execute it and falls back to
+      undefined behavior.
+    - ``printer_model_id`` inside ``slice_info.config`` doesn't match
+      ``expected_printer_model_id``. Set ``allow_printer_mismatch=True``
+      to demote this to a warning (only do this when you're intentionally
+      sending hand-crafted gcode for an experimental workflow).
+    """
+    if not file_path.is_file():
+        raise DispatchError(f"validate_file: file not found: {file_path}")
+
+    gcode_member = f"Metadata/plate_{plate}.gcode"
+    detected_model_id = ""
+    sliced = False
+
+    with zipfile.ZipFile(file_path, "r") as zf:
+        names = set(zf.namelist())
+        sliced = gcode_member in names
+        if SLICE_INFO_MEMBER in names:
+            blob = zf.read(SLICE_INFO_MEMBER).decode("utf-8", errors="replace")
+            m = _PRINTER_MODEL_ID_RE.search(blob)
+            if m:
+                detected_model_id = m.group(1).strip()
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not sliced:
+        errors.append(
+            f"file appears unsliced: no '{gcode_member}' inside the .3mf. "
+            "In Bambu Studio use 'File > Export > Export Plate Sliced 3mf' "
+            "after slicing; a plain 'Save Project' (.3mf) won't include gcode."
+        )
+
+    mismatch = bool(detected_model_id) and detected_model_id != expected_printer_model_id
+    if mismatch:
+        msg = (
+            f"printer model mismatch: .3mf was sliced for '{detected_model_id}', "
+            f"but the target printer expects '{expected_printer_model_id}'. "
+            "Open the file in Bambu Studio, switch the printer selector to the "
+            "correct machine, re-slice, and re-export. Sending mismatched gcode "
+            "is what causes 'no bed leveling, mid-air extrusion' failures."
+        )
+        if allow_printer_mismatch:
+            warnings.append(msg + " (allowed by --allow-printer-mismatch)")
+        else:
+            errors.append(msg)
+
+    return FileValidation(
+        sliced=sliced,
+        detected_model_id=detected_model_id,
+        expected_model_id=expected_printer_model_id,
+        plate=plate,
+        errors=errors,
+        warnings=warnings,
+    )
 
 
 class DispatchError(RuntimeError):
