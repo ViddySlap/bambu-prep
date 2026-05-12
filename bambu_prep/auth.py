@@ -35,6 +35,7 @@ from pathlib import Path
 
 
 BAMBU_LOGIN_URL = "https://api.bambulab.com/v1/user-service/user/login"
+BAMBU_SEND_CODE_URL = "https://api.bambulab.com/v1/user-service/user/sendemail/code"
 
 DEFAULT_CACHE_PATH = Path.home() / ".bambu_prep" / "token.json"
 
@@ -62,6 +63,7 @@ class AuthError(RuntimeError):
 
 LoginFn = Callable[[str, str], Token]
 StudioReadFn = Callable[[Path], "Token | None"]
+CodePromptFn = Callable[[str], str]
 
 
 def get_token(
@@ -227,18 +229,36 @@ def _write_cache(cache_path: Path, token: Token) -> None:
     cache_path.write_text(json.dumps(blob, indent=2), encoding="utf-8")
 
 
-def _default_login(email: str, password: str) -> Token:
-    """Programmatic login against Bambu Cloud's user-service endpoint.
+def _default_login(
+    email: str,
+    password: str,
+    *,
+    code_prompt: CodePromptFn | None = None,
+) -> Token:
+    """Programmatic login against Bambu Cloud, handling the 2FA email flow.
+
+    Bambu Cloud requires an email verification code on first login from a
+    new device. The flow:
+
+    1. POST ``/user/login`` with ``{account, password, apiError: ""}``. A
+       correct password returns 200 with ``loginType: "verifyCode"`` and an
+       empty access token, signaling 2FA is required.
+    2. POST ``/user/sendemail/code`` to trigger the email.
+    3. Prompt the user for the 6-digit code (stdin by default; injectable
+       for tests and for future server-side runners).
+    4. POST ``/user/login`` again with ``{account, code}`` to exchange the
+       code for an access token.
 
     Lazy-imports ``requests`` so test runs that mock ``login_fn`` don't pay
-    the import cost and so an environment missing ``requests`` still loads
-    this module.
+    the import cost.
     """
     import requests  # noqa: PLC0415
 
+    code_prompt = code_prompt or _default_code_prompt
+
     resp = requests.post(
         BAMBU_LOGIN_URL,
-        json={"account": email, "password": password},
+        json={"account": email, "password": password, "apiError": ""},
         timeout=15,
     )
     if resp.status_code != 200:
@@ -246,6 +266,34 @@ def _default_login(email: str, password: str) -> Token:
             f"Bambu Cloud login failed: HTTP {resp.status_code} {resp.text[:200]}"
         )
     data = resp.json()
+
+    if data.get("loginType") == "verifyCode":
+        # 2FA required. Trigger email send and exchange code for token.
+        send_resp = requests.post(
+            BAMBU_SEND_CODE_URL,
+            json={"email": email, "type": "codeLogin"},
+            timeout=15,
+        )
+        if send_resp.status_code != 200:
+            raise AuthError(
+                f"Bambu Cloud failed to send verification code: "
+                f"HTTP {send_resp.status_code} {send_resp.text[:200]}"
+            )
+        code = code_prompt(email).strip()
+        if not code:
+            raise AuthError("no verification code entered; aborting login")
+        verify_resp = requests.post(
+            BAMBU_LOGIN_URL,
+            json={"account": email, "code": code},
+            timeout=15,
+        )
+        if verify_resp.status_code != 200:
+            raise AuthError(
+                f"Bambu Cloud code-verify failed: "
+                f"HTTP {verify_resp.status_code} {verify_resp.text[:200]}"
+            )
+        data = verify_resp.json()
+
     access = data.get("accessToken") or data.get("access_token")
     if not isinstance(access, str) or not access:
         raise AuthError(f"Bambu Cloud login response missing access token: {data}")
@@ -257,3 +305,24 @@ def _default_login(email: str, password: str) -> Token:
         expires_at=expires_at,
         source="login",
     )
+
+
+def _default_code_prompt(email: str) -> str:
+    """Prompt the user on stdin for the 6-digit Bambu Cloud verification code.
+
+    The message goes to stderr so the prompt is visible even when stdout is
+    being piped or captured. The skill caller can also intercept by
+    injecting ``code_prompt=...`` to :func:`_default_login` when wiring
+    against a non-interactive runner.
+    """
+    print(
+        f"\n[bambu-prep] Bambu Cloud sent a verification code to {email}.",
+        file=sys.stderr,
+    )
+    print(
+        "[bambu-prep] Enter the 6-digit code: ",
+        file=sys.stderr,
+        end="",
+        flush=True,
+    )
+    return input()

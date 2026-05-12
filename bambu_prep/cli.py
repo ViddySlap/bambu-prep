@@ -323,22 +323,21 @@ def fetch(url: str, subfolder: str, output_path: Path | None) -> None:
         sys.exit(2)
 
     # Rename to a clean, name-based filename now that we know what the maker called it.
+    final_path = result.path
     if output_path.name.startswith("makerworld_"):
         safe = _sanitize_filename(result.name)
         renamed = output_path.with_name(f"{safe}_{date.today().isoformat()}.3mf")
         if renamed != output_path:
-            output_path.rename(renamed)
-            result = result.__class__(  # immutable dataclass; rebuild
-                path=renamed,
-                design_id=result.design_id,
-                profile_id=result.profile_id,
-                name=result.name,
-            )
+            # Use replace() not rename() so an existing target (e.g. from a prior
+            # partial run) is overwritten rather than crashing on Windows.
+            output_path.replace(renamed)
+            final_path = renamed
 
     click.echo(f"name: {result.name}")
     click.echo(f"design_id: {result.design_id}")
-    click.echo(f"profile_id: {result.profile_id}")
-    click.echo(f"output: {result.path}")
+    click.echo(f"instance_id: {result.instance_id}")
+    click.echo(f"profile_id: {result.profile_id}  (resolved slicer profile)")
+    click.echo(f"output: {final_path}")
 
 
 @main.command()
