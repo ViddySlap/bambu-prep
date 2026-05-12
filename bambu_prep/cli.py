@@ -52,6 +52,7 @@ from bambu_prep.dispatch import (
     preflight as dispatch_preflight,
     start as dispatch_start,
     upload as dispatch_upload,
+    validate_file as dispatch_validate_file,
 )
 from bambu_prep.makerworld import MakerWorldError, fetch as makerworld_fetch
 from bambu_prep.meshes import ScaleFactor
@@ -380,6 +381,15 @@ def fetch(url: str, subfolder: str, output_path: Path | None) -> None:
     "state is correct independently. Workaround for bambulabs-api MQTT state issues "
     "when upload + preflight happen back-to-back in the same process.",
 )
+@click.option(
+    "--allow-printer-mismatch",
+    is_flag=True,
+    default=False,
+    help="Permit sending a .3mf whose embedded printer_model_id doesn't match the A1. "
+    "Only use this when intentionally dispatching hand-crafted or experimental gcode "
+    "(e.g. Blender-manipulated non-linear layers). Default is hard-fail: the file-"
+    "validation check prevents the X1C-sliced-but-sent-to-A1 failure mode.",
+)
 def send(
     file_path: Path,
     plate: int,
@@ -387,6 +397,7 @@ def send(
     do_start: bool,
     no_ams: bool,
     skip_preflight: bool,
+    allow_printer_mismatch: bool,
 ) -> None:
     """Upload a sliced .3mf to the A1, run preflight, and optionally start the print.
 
@@ -402,6 +413,33 @@ def send(
     config = load_config()
 
     ams_mapping = _parse_ams_mapping(ams_mapping_str) if ams_mapping_str else None
+
+    try:
+        validation = dispatch_validate_file(
+            file_path,
+            plate=plate,
+            allow_printer_mismatch=allow_printer_mismatch,
+        )
+    except DispatchError as e:
+        click.echo(f"send: {e}", err=True)
+        sys.exit(2)
+    for w in validation.warnings:
+        click.echo(f"validate: warning: {w}")
+    if not validation.ok:
+        click.echo("validate: REFUSING to upload", err=True)
+        for err in validation.errors:
+            click.echo(f"  - {err}", err=True)
+        sys.exit(3)
+    if validation.detected_model_id:
+        click.echo(
+            f"validate: ok (sliced for '{validation.detected_model_id}', "
+            f"plate {plate} has gcode)"
+        )
+    else:
+        click.echo(
+            f"validate: ok (plate {plate} has gcode; printer_model_id absent, "
+            "skipped model check)"
+        )
 
     try:
         remote_name = dispatch_upload(file_path, config=config)

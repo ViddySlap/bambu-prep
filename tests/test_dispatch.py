@@ -6,8 +6,10 @@ import pytest
 from bambu_prep.ams import TrayInfo
 from bambu_prep.config import Config, Printer
 from bambu_prep.dispatch import (
+    DEFAULT_A1_MODEL_ID,
     DispatchError,
     FilamentRequirement,
+    FileValidation,
     PreflightReport,
     SlotCompatibility,
     _family,
@@ -16,6 +18,7 @@ from bambu_prep.dispatch import (
     preflight,
     start,
     upload,
+    validate_file,
 )
 
 
@@ -392,3 +395,119 @@ def test_start_printer_rejects() -> None:
     with pytest.raises(DispatchError) as exc:
         start("p.3mf", config=_config_with_printer(), start_fn=lambda *_: False)
     assert "rejected" in str(exc.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# validate_file
+# ---------------------------------------------------------------------------
+
+
+def _make_validation_3mf(
+    path: Path,
+    *,
+    include_gcode: bool = True,
+    printer_model_id: str | None = DEFAULT_A1_MODEL_ID,
+    plate: int = 1,
+) -> Path:
+    with zipfile.ZipFile(path, "w") as zf:
+        si_lines = ["<config><plate>"]
+        if printer_model_id is not None:
+            si_lines.append(
+                f'<metadata key="printer_model_id" value="{printer_model_id}"/>'
+            )
+        si_lines.append("</plate></config>")
+        zf.writestr("Metadata/slice_info.config", "\n".join(si_lines))
+        if include_gcode:
+            zf.writestr(f"Metadata/plate_{plate}.gcode", "; gcode body\nG28\n")
+    return path
+
+
+def test_validate_file_happy_a1(tmp_path: Path) -> None:
+    p = _make_validation_3mf(tmp_path / "ok.3mf")
+    result = validate_file(p)
+    assert result.ok
+    assert result.sliced
+    assert result.detected_model_id == "N2S"
+    assert result.model_id_match
+    assert result.errors == []
+
+
+def test_validate_file_rejects_x1c_for_a1(tmp_path: Path) -> None:
+    p = _make_validation_3mf(tmp_path / "x1c.3mf", printer_model_id="BL-P001")
+    result = validate_file(p)
+    assert not result.ok
+    assert result.detected_model_id == "BL-P001"
+    assert not result.model_id_match
+    assert any("BL-P001" in e and "N2S" in e for e in result.errors)
+
+
+def test_validate_file_allow_mismatch_demotes_to_warning(tmp_path: Path) -> None:
+    p = _make_validation_3mf(tmp_path / "x1c.3mf", printer_model_id="BL-P001")
+    result = validate_file(p, allow_printer_mismatch=True)
+    assert result.ok
+    assert not result.model_id_match
+    assert any("BL-P001" in w for w in result.warnings)
+
+
+def test_validate_file_rejects_save_project_no_gcode(tmp_path: Path) -> None:
+    """The trap: 'Save Project' produces a .3mf that has slice_info.config
+    but no plate_N.gcode. Looks sliced; isn't."""
+    p = _make_validation_3mf(tmp_path / "save.3mf", include_gcode=False)
+    result = validate_file(p)
+    assert not result.ok
+    assert not result.sliced
+    assert any("unsliced" in e.lower() or "plate_1.gcode" in e for e in result.errors)
+
+
+def test_validate_file_missing_model_id_is_ok(tmp_path: Path) -> None:
+    """If the .3mf doesn't carry a printer_model_id (rare; older Studio
+    versions, manual gcode injection), we can't compare it; don't block."""
+    p = _make_validation_3mf(tmp_path / "noid.3mf", printer_model_id=None)
+    result = validate_file(p)
+    assert result.ok
+    assert result.detected_model_id == ""
+
+
+def test_validate_file_both_errors_at_once(tmp_path: Path) -> None:
+    """Wrong printer AND not actually sliced should both be reported."""
+    p = _make_validation_3mf(
+        tmp_path / "double.3mf", include_gcode=False, printer_model_id="BL-P001"
+    )
+    result = validate_file(p)
+    assert not result.ok
+    assert len(result.errors) == 2
+
+
+def test_validate_file_missing_path_raises(tmp_path: Path) -> None:
+    with pytest.raises(DispatchError):
+        validate_file(tmp_path / "missing.3mf")
+
+
+def test_validate_file_plate_2_check(tmp_path: Path) -> None:
+    """Multi-plate file: validate plate 2 specifically."""
+    with zipfile.ZipFile(tmp_path / "multi.3mf", "w") as zf:
+        zf.writestr(
+            "Metadata/slice_info.config",
+            f'<config><plate><metadata key="printer_model_id" value="{DEFAULT_A1_MODEL_ID}"/></plate></config>',
+        )
+        zf.writestr("Metadata/plate_1.gcode", "; plate 1\n")
+        # plate_2.gcode intentionally missing
+    result = validate_file(tmp_path / "multi.3mf", plate=2)
+    assert not result.ok
+    assert any("plate_2.gcode" in e for e in result.errors)
+
+
+def test_validate_file_catches_real_clicker_artifact() -> None:
+    """Regression test against the actual failed-print artifact from 2026-05-11."""
+    p = Path(
+        "D:/Baros Design Co. Dropbox/Ben Baros/AI AGENTS/3D PRINTING/clicker-fidget/"
+        "Single_Color_-_Let_Print_Cool_Before_Clicking!!!_2026-05-11-sliced.gcode-sliced.gcode.3mf"
+    )
+    if not p.is_file():
+        pytest.skip("local artifact not present on this machine")
+    result = validate_file(p)
+    assert not result.ok, (
+        "This is the real broken file; it should have been refused. "
+        f"detected_model_id={result.detected_model_id!r}, errors={result.errors}"
+    )
+    assert result.detected_model_id == "BL-P001"
