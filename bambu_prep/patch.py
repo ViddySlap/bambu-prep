@@ -49,6 +49,7 @@ OBJECTS_PREFIX = "3D/Objects/"
 _OBJECT_TAG_RE = re.compile(r'<object\s+id="\d+">')
 _OBJECT_BLOCK_RE = re.compile(r'(<object\s+id="\d+">)(.*?)(</object>)', re.DOTALL)
 _EXTRUDER_RE = re.compile(r'\s*<metadata\s+key="extruder"\s+value="\d+"\s*/>')
+_BUILD_ITEM_TRANSFORM_RE = re.compile(r'(<item\b[^>]*\btransform=")[^"]*(")')
 
 _PRODUCTION_EXT_NS_RE = re.compile(r'\s*xmlns:p="[^"]*"')
 _REQUIRED_EXT_RE = re.compile(r'\s*requiredextensions="p"')
@@ -69,12 +70,17 @@ class PatchError(ValueError):
     """Raised when the .3mf doesn't have the shape these helpers expect."""
 
 
-def finalize_cli_output(threempf_path: Path, slot_per_object: list[int]) -> None:
+def finalize_cli_output(
+    threempf_path: Path,
+    slot_per_object: list[int],
+    transforms_per_item: list[str] | None = None,
+) -> None:
     """Make a ``bambu-studio.exe --export-3mf`` output openable in the Studio GUI.
 
-    Reads the zip once, applies the four-step rewrite (inline geometry,
-    strip production-extension cruft, sanitize ``model_settings.config``,
-    patch per-object AMS slot metadata), writes once.
+    Reads the zip once, applies the rewrite (inline geometry, strip
+    production-extension cruft, optionally patch build-item transforms,
+    sanitize ``model_settings.config``, patch per-object AMS slot metadata),
+    writes once.
 
     Parameters
     ----------
@@ -83,12 +89,19 @@ def finalize_cli_output(threempf_path: Path, slot_per_object: list[int]) -> None
     slot_per_object
         One AMS slot number per ``<object>`` in ``model_settings.config``,
         in document order. Length must equal the object count.
+    transforms_per_item
+        One 12-float 3MF transform string per ``<item>`` in 3D/3dmodel.model's
+        ``<build>`` section, in document order. Use when the CLI ran with
+        ``--arrange 0`` and we computed positions ourselves. ``None`` leaves
+        the CLI-emitted transforms alone.
     """
     members = _read_zip(threempf_path)
 
     root_text = members.get(ROOT_MODEL_MEMBER, b"").decode("utf-8")
     root_text = _inline_components(root_text, members)
     root_text = _strip_production_extension(root_text)
+    if transforms_per_item is not None:
+        root_text = _patch_build_item_transforms(root_text, transforms_per_item)
     members[ROOT_MODEL_MEMBER] = root_text.encode("utf-8")
 
     # Drop the per-object model files and the rels that reference them.
@@ -194,6 +207,24 @@ def _sanitize_model_settings(text: str) -> str:
         text = re.sub(rf'\s*<metadata\s+key="{key}"[^/]*/>', "", text)
     text = re.sub(r'\s*<metadata\s+key="gcode_file"\s+value=""\s*/>', "", text)
     return text
+
+
+def _patch_build_item_transforms(root_text: str, transforms: list[str]) -> str:
+    """Replace each ``<item ... transform="...">`` value in document order."""
+    matches = list(_BUILD_ITEM_TRANSFORM_RE.finditer(root_text))
+    if len(matches) != len(transforms):
+        raise PatchError(
+            f"build item count mismatch: 3dmodel.model has {len(matches)} "
+            f"<item> entries, transforms_per_item has {len(transforms)}"
+        )
+    out = []
+    cursor = 0
+    for i, m in enumerate(matches):
+        out.append(root_text[cursor : m.start()])
+        out.append(f"{m.group(1)}{transforms[i]}{m.group(2)}")
+        cursor = m.end()
+    out.append(root_text[cursor:])
+    return "".join(out)
 
 
 def _inject_extruder_metadata(config_text: str, slot_per_object: list[int]) -> str:

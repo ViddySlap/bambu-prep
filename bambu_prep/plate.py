@@ -31,15 +31,16 @@ should put lowest-priority copies last.
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
-import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import trimesh
+
 from bambu_prep.config import Config
+from bambu_prep.layout import Bbox, compute_layout, transform_matrix
 from bambu_prep.meshes import (
     ScaleFactor,
     is_identity_scale,
@@ -93,21 +94,6 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 def default_runner(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-
-def _output_uses_multiple_plates(output_path: Path) -> bool:
-    """True if the CLI auto-paginated onto more than one plate.
-
-    Bambu's CLI doesn't fail when objects overflow; it just creates a
-    plate_2. Reading model_settings.config for a second ``<plate>`` block
-    is the cheapest reliable detector.
-    """
-    try:
-        with zipfile.ZipFile(output_path) as zf:
-            cfg = zf.read("Metadata/model_settings.config").decode("utf-8", errors="replace")
-    except (OSError, KeyError, zipfile.BadZipFile):
-        return False
-    return len(re.findall(r"<plate>", cfg)) > 1
 
 
 def _physical_inputs(items: list[PlateItem], job_dir: Path) -> dict[int, Path]:
@@ -179,10 +165,15 @@ def build_cli_args(
         str(filament_paths_by_slot.get(slot, filler)) for slot in range(1, max_slot + 1)
     ]
 
-    # NOTE: --load-filament-ids is silently ignored by Bambu Studio 02.05.00.66
-    # in plate-prep CLI mode (verified 2026-05-11). The per-object slot
-    # assignment is applied by bambu_prep.patch.patch_filament_slots after
+    # NOTE on slot assignment: --load-filament-ids parses but is silently
+    # ignored by Bambu Studio 02.05.00.66 in plate-prep CLI mode (verified
+    # 2026-05-11). The per-object slot is applied by bambu_prep.patch after
     # the CLI returns.
+    #
+    # NOTE on arrangement: --arrange 1 packs more conservatively than the GUI
+    # (won't fit 3 cases that fit by hand). We run with --arrange 0 and
+    # patch each build item's transform with positions computed by
+    # bambu_prep.layout.
     args: list[str] = [
         str(config.paths.bambu_studio_exe),
         "--load-settings",
@@ -192,9 +183,9 @@ def build_cli_args(
         "--clone-objects",
         ",".join(str(i.clone_count) for i in inputs),
         "--arrange",
-        "1",
+        "0",
         "--orient",
-        "1",
+        "0",
     ]
     if config.behavior.allow_rotations:
         args.append("--allow-rotations")
@@ -287,6 +278,15 @@ def prepare_plate(
     try:
         while items_remaining:
             physicals = _physical_inputs(items_remaining, job_dir)
+
+            # Pre-flight: compute a tight layout from the actual STL bboxes.
+            # If everything doesn't fit on one plate, drop the last item and
+            # retry before we spend ~1s on a CLI run that we'd reject anyway.
+            placements = _layout_for_items(items_remaining, physicals)
+            if placements is None:
+                dropped.insert(0, items_remaining.pop())
+                continue
+
             cli_inputs = consolidate(items_remaining, physicals)
             cmd = build_cli_args(
                 cli_inputs,
@@ -299,25 +299,24 @@ def prepare_plate(
             last_command = cmd
 
             if output_path.is_file():
-                output_path.unlink()  # prevent false success on stale file
+                output_path.unlink()
 
             completed = runner(cmd)
             last_stdout = completed.stdout or ""
             last_stderr = completed.stderr or ""
 
             if completed.returncode == 0 and output_path.is_file():
-                # Bambu Studio's CLI silently paginates onto additional plates
-                # when one isn't enough. We want a single-plate result; treat
-                # multi-plate output as overflow and shrink.
-                if _output_uses_multiple_plates(output_path):
-                    dropped.insert(0, items_remaining.pop())
-                    continue
                 slot_per_object = [
                     cli_in.ams_slot
                     for cli_in in cli_inputs
                     for _ in range(cli_in.clone_count)
                 ]
-                finalize_cli_output(output_path, slot_per_object)
+                transforms = [transform_matrix(p) for p in placements]
+                finalize_cli_output(
+                    output_path,
+                    slot_per_object=slot_per_object,
+                    transforms_per_item=transforms,
+                )
                 return PrepareResult(
                     fit=len(items_remaining),
                     requested=len(items),
@@ -342,3 +341,21 @@ def prepare_plate(
     finally:
         if not keep_temp:
             shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _layout_for_items(items, physicals):
+    """Compute layout for ``items`` based on their pre-scaled STL bboxes.
+
+    Reads the bbox of each physical input via trimesh; returns Placements
+    in item order, or ``None`` if the items don't fit on the plate.
+    """
+    bbox_cache: dict[Path, Bbox] = {}
+    bboxes: list[Bbox] = []
+    for i, item in enumerate(items):
+        path = physicals[i]
+        if path not in bbox_cache:
+            mesh = trimesh.load(path, force="mesh")
+            ext = mesh.bounding_box.extents
+            bbox_cache[path] = Bbox(dx=float(ext[0]), dy=float(ext[1]), dz=float(ext[2]))
+        bboxes.append(bbox_cache[path])
+    return compute_layout(bboxes)

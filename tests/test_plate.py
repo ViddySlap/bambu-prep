@@ -54,31 +54,54 @@ def _build_config(tmp_path: Path) -> Config:
 
 
 def _build_fake_3mf(cmd: list[str], *, plate_count: int = 1) -> bytes:
-    """Construct a minimal .3mf zip whose model_settings.config has one
-    <object> per CLI input clone, in input order. This is enough for
-    prepare_plate's post-CLI patch_filament_slots step to run end-to-end.
+    """Construct a minimal .3mf zip with one <object> per CLI input clone
+    plus matching <item> entries in 3D/3dmodel.model's <build> section.
+    This is enough for prepare_plate's finalize_cli_output post-process
+    (slot patching + transform patching) to run end-to-end.
 
-    ``plate_count`` lets a test simulate the CLI auto-paginating across plates.
+    ``plate_count`` is no longer used (kept for back-compat with older
+    tests; layout-based overflow detection means the CLI never auto-
+    paginates in our pipeline).
     """
+    del plate_count  # noqa: unused; retained for older test signatures
     idx = cmd.index("--clone-objects")
     counts = [int(x) for x in cmd[idx + 1].split(",")]
     total = sum(counts)
+
+    object_ids = [2 * (i + 1) for i in range(total)]
     objects_xml = "\n".join(
-        f'  <object id="{2 * (i + 1)}">\n'
+        f'  <object id="{oid}">\n'
         f'    <metadata key="name" value="cube_{i + 1}"/>\n'
         f"  </object>"
-        for i in range(total)
+        for i, oid in enumerate(object_ids)
     )
-    plates_xml = "\n".join(f"  <plate>\n  </plate>" for _ in range(plate_count))
     config_text = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f"<config>\n{objects_xml}\n{plates_xml}\n</config>\n"
+        f'<config>\n{objects_xml}\n  <plate>\n  </plate>\n</config>\n'
     )
+
+    build_items_xml = "\n".join(
+        f'  <item objectid="{oid}" transform="1 0 0 0 1 0 0 0 1 0 0 0" printable="1"/>'
+        for oid in object_ids
+    )
+    root_model = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+        ' <resources>\n'
+        + "\n".join(
+            f'  <object id="{oid}" type="model"><mesh/></object>'
+            for oid in object_ids
+        )
+        + "\n </resources>\n"
+        f" <build>\n{build_items_xml}\n </build>\n</model>\n"
+    )
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("Metadata/model_settings.config", config_text)
         zf.writestr("Metadata/project_settings.config", "{}")
-        zf.writestr("3D/3dmodel.model", "<model/>")
+        zf.writestr("3D/3dmodel.model", root_model)
     return buf.getvalue()
 
 
@@ -257,8 +280,11 @@ def test_build_cli_args_arrange_and_orient_take_values(tmp_path: Path) -> None:
         output_path=tmp_path / "out.3mf",
         config=cfg,
     )
-    assert args[args.index("--arrange") + 1] == "1"
-    assert args[args.index("--orient") + 1] == "1"
+    # prepare_plate runs --arrange 0 / --orient 0 because layout is DIY'd
+    # post-CLI (see bambu_prep.layout); the CLI's auto-arrange packs too
+    # conservatively for our needs.
+    assert args[args.index("--arrange") + 1] == "0"
+    assert args[args.index("--orient") + 1] == "0"
 
 
 def test_build_cli_args_rejects_empty_inputs(tmp_path: Path) -> None:
@@ -545,21 +571,18 @@ def test_prepare_plate_patches_single_slot_uses_slot_1(tmp_path: Path) -> None:
     assert _extruder_counts_in_3mf(out) == Counter({"1": 3})
 
 
-def test_prepare_plate_multi_plate_treated_as_overflow(tmp_path: Path) -> None:
-    """The CLI silently paginates onto plate 2 instead of failing on overflow.
-    prepare_plate must detect this and drop the last item to force single-plate."""
+def test_prepare_plate_layout_overflow_drops_without_cli(tmp_path: Path) -> None:
+    """Layout pre-flight catches plate overflow; CLI is not invoked
+    on iterations where the layout would fail."""
     cfg = _build_config(tmp_path)
-    stl = tmp_path / "cube.stl"
-    _write_cube(stl)
+    stl = tmp_path / "big.stl"
+    # 200mm cube. Row of 3 = 602mm; grid of 2x2 = 401mm depth. No way to
+    # fit more than 1 on a 256x256 plate.
+    _write_cube(stl, side=200.0)
     out = tmp_path / "out.3mf"
 
-    # First call: CLI succeeds but writes 2 plates -> treat as overflow.
-    # Second call (after shrink): CLI succeeds with 1 plate -> accept.
     items = [PlateItem(stl, 1.0, 1)] * 3
-    runner = FakeRunner(
-        results=[(0, True, 2), (0, True, 1)],
-        output_path=out,
-    )
+    runner = FakeRunner(results=[(0, True)], output_path=out)
     result = prepare_plate(
         items=items,
         machine_profile="Test A1",
@@ -569,9 +592,44 @@ def test_prepare_plate_multi_plate_treated_as_overflow(tmp_path: Path) -> None:
         config=cfg,
         runner=runner,
     )
-    assert result.fit == 2
-    assert result.dropped == [items[-1]]
-    assert len(runner.calls) == 2
+    # Only one fits (200x200 < 256x256). Two drops occurred before the
+    # CLI was invoked even once.
+    assert result.fit == 1
+    assert len(result.dropped) == 2
+    assert len(runner.calls) == 1
+
+
+def test_prepare_plate_passes_transforms_to_finalize(tmp_path: Path) -> None:
+    """The output .3mf should have the layout-computed transforms applied,
+    not the (0,0,0) the CLI emits with --arrange 0."""
+    cfg = _build_config(tmp_path)
+    stl = tmp_path / "cube.stl"
+    _write_cube(stl, side=10.0)
+    out = tmp_path / "out.3mf"
+
+    runner = FakeRunner(results=[(0, True)], output_path=out)
+    prepare_plate(
+        items=[PlateItem(stl, 1.0, 1)] * 3,
+        machine_profile="Test A1",
+        process_profile="Test 0.2mm",
+        output_path=out,
+        ams_state={1: "Test Matte Black"},
+        config=cfg,
+        runner=runner,
+    )
+
+    # CLI was invoked with --arrange 0
+    assert runner.calls[0][runner.calls[0].index("--arrange") + 1] == "0"
+
+    with zipfile.ZipFile(out) as zf:
+        root = zf.read("3D/3dmodel.model").decode("utf-8")
+    transforms = re.findall(r'transform="([^"]+)"', root)
+    # All three items got non-origin positions (post-patch transforms)
+    assert len(transforms) == 3
+    for t in transforms:
+        parts = t.split()
+        cx, cy = float(parts[9]), float(parts[10])
+        assert cx > 0 and cy > 0, f"transform left at origin: {t}"
 
 
 def test_prepare_plate_keep_temp_preserves_job_dir(tmp_path: Path) -> None:
