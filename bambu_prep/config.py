@@ -25,6 +25,9 @@ from pathlib import Path
 
 DEFAULT_BAMBU_STUDIO_EXE = Path("C:/Program Files/Bambu Studio/bambu-studio.exe")
 DEFAULT_BAMBU_RESOURCES_DIR = Path("C:/Program Files/Bambu Studio/resources")
+DEFAULT_ORCASLICER_EXE = Path(
+    Path.home() / "Documents/tools/OrcaSlicer/orca-slicer.exe"
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,12 @@ class Paths:
     bambu_studio_exe: Path = DEFAULT_BAMBU_STUDIO_EXE
     bambu_resources_dir: Path = DEFAULT_BAMBU_RESOURCES_DIR
     bambu_user_dir: Path | None = None
+    orcaslicer_exe: Path = DEFAULT_ORCASLICER_EXE
+    """OrcaSlicer CLI executable, used by the ``slice`` subcommand to drive
+    headless slicing. OrcaSlicer succeeds on the A1 vendor profile where
+    Bambu Studio 02.05.00.66's ``--slice 0`` SIGSEGVs at 71% (upstream
+    bug #9636). Defaults to the portable install path
+    ``~/Documents/tools/OrcaSlicer/orca-slicer.exe``."""
     temp_scratch_dir: Path = field(
         default_factory=lambda: Path(tempfile.gettempdir()) / "bambu-prep"
     )
@@ -142,6 +151,7 @@ def _build_paths(section: dict) -> Paths:
             section.get("bambu_resources_dir"), defaults.bambu_resources_dir
         ),
         bambu_user_dir=_optional_path(section.get("bambu_user_dir")),
+        orcaslicer_exe=_path_or(section.get("orcaslicer_exe"), defaults.orcaslicer_exe),
         temp_scratch_dir=_path_or(section.get("temp_scratch_dir"), defaults.temp_scratch_dir),
     )
 

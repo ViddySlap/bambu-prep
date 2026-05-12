@@ -60,6 +60,11 @@ from bambu_prep.retarget import (
     RetargetResult,
     retarget as retarget_3mf,
 )
+from bambu_prep.slice import (
+    SliceError,
+    SliceResult,
+    slice_3mf,
+)
 from bambu_prep.meshes import ScaleFactor
 from bambu_prep.plate import PlateItem, PrepareError, prepare_plate
 from bambu_prep.profiles import ProfileError, list_profiles
@@ -615,6 +620,77 @@ def retarget(
         f"retarget: rewrote {result.fields_changed} field(s) in {result.output_path.name} "
         f"to target '{result.target_machine}' (model_id={result.target_machine_model_id})."
     )
+
+
+@main.command(name="slice")
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output sliced .3mf path. Default: <input>.gcode.3mf alongside the input.",
+)
+@click.option(
+    "--plate",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Plate to slice. 0 = all plates, N = plate N only (1-indexed).",
+)
+@click.option(
+    "--model-id",
+    "target_model_id",
+    default="N2S",
+    show_default=True,
+    help="Printer model_id to write into slice_info.config so send preflight "
+    "has a definitive match (OrcaSlicer leaves this empty by default).",
+)
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    type=float,
+    default=600.0,
+    show_default=True,
+    help="OrcaSlicer wall-clock timeout in seconds.",
+)
+def slice_cmd(
+    file_path: Path,
+    output_path: Path | None,
+    plate: int,
+    target_model_id: str,
+    timeout_seconds: float,
+) -> None:
+    """Slice a (retargeted) .3mf using OrcaSlicer's CLI.
+
+    OrcaSlicer succeeds on the A1 vendor profile where Bambu Studio
+    02.05.00.66's `--slice 0` SIGSEGVs at 71% (upstream bug
+    bambulab/BambuStudio#9636). Run `retarget` on the input first so
+    the file is A1-flavored; slicing a non-A1-targeted file would
+    emit gcode for the wrong machine.
+
+    Output is a sliced .3mf with `Metadata/plate_<N>.gcode` embedded.
+    Pass that file straight to `send`.
+    """
+    config = load_config()
+    try:
+        result = slice_3mf(
+            file_path,
+            config=config,
+            output_path=output_path,
+            plate=plate,
+            target_printer_model_id=target_model_id,
+            timeout_seconds=timeout_seconds,
+        )
+    except SliceError as e:
+        click.echo(f"slice: {e}", err=True)
+        sys.exit(2)
+
+    click.echo(
+        f"slice: ok ({result.duration_seconds:.1f}s) -> {result.output_path}"
+    )
+    if result.model_id_patched:
+        click.echo(f"slice: patched printer_model_id to '{target_model_id}'")
 
 
 @main.command(name="list-profiles")
